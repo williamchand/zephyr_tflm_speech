@@ -206,6 +206,15 @@ with the spectrogram features as input, and category probabilities as output
 1) Check the largest category probability for a match with the speech sample label.
 
 ## Run the evaluate.py script on a development machine
+
+The `evaluate.py` helper now includes a simple streaming inference
+implementation.  A fixed‑size ring buffer holds the last
+`_FEATURES_SHAPE[0]` feature frames; every time a new frame is added the
+oldest one is discarded.  When the model reports a keyword ("yes" or "no")
+the buffer is immediately cleared to zero so that the next command starts
+with a clean window.  This behaviour can be observed by running the script
+and supplying `--detection_threshold` to adjust the sensitivity.
+
 The [evaluate.py](evaluate.py#L166) script predicts the category of a single audio sample
 given by the `sample_path` argument.  The output consists of the predictions for
 the accumulated spectrogram features across (at most) 49 audio sample window frames.
