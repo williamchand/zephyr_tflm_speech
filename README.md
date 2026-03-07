@@ -1,5 +1,17 @@
 <!-- mdformat off(b/169948621#comment2) -->
 
+## Quickstart
+
+### 1. Clone with submodule
+git clone --recurse-submodules \
+  https://github.com/williamchand/zephyr-tflm-speech-pipeline
+
+### 2. Setup links (run once)
+python3 scripts/setup_links.py
+
+### 3. Run tests yourself
+cd tflite-micro
+
 # Micro Speech Example
 
 This example shows how to run inference using TensorFlow Lite Micro (TFLM)
