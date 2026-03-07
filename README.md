@@ -4,7 +4,7 @@
 
 ### 1. Clone with submodule
 git clone --recurse-submodules \
-  https://github.com/williamchand/zephyr-tflm-speech-pipeline
+  https://github.com/williamchand/zephyr_tflm_speech
 
 ### 2. Setup links (run once)
 python3 scripts/setup_links.py
@@ -295,4 +295,4 @@ bazel-bin/tensorflow/lite/micro/tools/generate_cc_arrays /tmp/header.h path_to_c
 So far you have used an existing trained model to run inference on
 microcontrollers. If you wish to train your own model, follow the instructions
 given in the [train](train/README.md) directory.
-# zephyr-tflm-speech-pipeline
+# zephyr_tflm_speech
