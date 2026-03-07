@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent.resolve()
-TFLM = REPO_ROOT / "tflite-micro/tensorflow/lite/micro/examples/micro_speech"
+TFLM = REPO_ROOT / "tflite_micro/tensorflow/lite/micro/examples/micro_speech"
 
 FILES_TO_LINK = [
     (REPO_ROOT / "micro_speech_test.cc",
@@ -26,12 +26,12 @@ FILES_TO_LINK = [
 
 def main():
     # check submodule is initialized
-    if not (REPO_ROOT / "tflite-micro/.git").exists():
-        print("ERROR: tflite-micro submodule not initialized.")
+    if not (REPO_ROOT / "tflite_micro/.git").exists():
+        print("ERROR: tflite_micro submodule not initialized.")
         print("Run: git submodule update --init --recursive")
         sys.exit(1)
 
-    print("==> Setting up links into tflite-micro...\n")
+    print("==> Setting up links into tflite_micro...\n")
     for src, dst in FILES_TO_LINK:
         if not src.exists():
             print(f"  ERROR: source not found: {src}")
@@ -50,7 +50,7 @@ def main():
 
     print("\n==> Done. You can now run:")
     print()
-    print("  cd tflite-micro")
+    print("  cd tflite_micro")
     print()
     print("  # Bazel")
     print("  bazel run tensorflow/lite/micro/examples/micro_speech:micro_speech_test")
