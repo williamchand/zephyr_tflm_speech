@@ -239,6 +239,67 @@ TfLiteStatus TestAudioSample(const char* label, const int16_t* audio_data,
   return kTfLiteOk;
 }
 
+
+
+// Helper routines for streaming-style inference using a fixed-size ring
+// buffer of feature frames.  After a keyword is detected the buffer is
+// explicitly cleared to simulate the suppression-window reset behaviour.
+
+// shift the contents of |buffer| up by one frame and append |new_feature|
+// to the end.  Oldest frame is discarded.
+void ShiftRingBuffer(Features& buffer, const int8_t* new_feature) {
+  for (int r = 0; r < kFeatureCount - 1; ++r) {
+    std::copy(&buffer[r + 1][0], &buffer[r + 1][0] + kFeatureSize,
+              &buffer[r][0]);
+  }
+  std::copy(new_feature, new_feature + kFeatureSize,
+            &buffer[kFeatureCount - 1][0]);
+}
+
+// clear every element of |buffer| to zero
+void ZeroRingBuffer(Features& buffer) {
+  for (int r = 0; r < kFeatureCount; ++r) {
+    std::fill(&buffer[r][0], &buffer[r][0] + kFeatureSize, 0);
+  }
+}
+
+// Run inference on a single feature-buffer array and return the index of the
+// highest-scoring category (0=silence,1=unknown,2=yes,3=no).  The predicted
+// probabilities are written into |out_scores| if it is non-null.
+int PredictCategory(const Features& features, float* out_scores = nullptr) {
+  const tflite::Model* model =
+      tflite::GetModel(g_micro_speech_quantized_model_data);
+  MicroSpeechOpResolver op_resolver;
+  TF_LITE_ENSURE_STATUS(RegisterOps(op_resolver));
+
+  tflite::MicroInterpreter interpreter(model, op_resolver, g_arena,
+                                       kArenaSize);
+  TF_LITE_ENSURE_STATUS(interpreter.AllocateTensors());
+
+  TfLiteTensor* input = interpreter.input(0);
+  std::copy_n(&features[0][0], kFeatureElementCount,
+              tflite::GetTensorData<int8_t>(input));
+  TF_LITE_ENSURE_STATUS(interpreter.Invoke());
+
+  TfLiteTensor* output = interpreter.output(0);
+  float scale = output->params.scale;
+  int zero_point = output->params.zero_point;
+  int best_index = 0;
+  float best_score = -1e9f;
+  for (int i = 0; i < kCategoryCount; ++i) {
+    float score =
+        (tflite::GetTensorData<int8_t>(output)[i] - zero_point) * scale;
+    if (out_scores) {
+      out_scores[i] = score;
+    }
+    if (score > best_score) {
+      best_score = score;
+      best_index = i;
+    }
+  }
+  return best_index;
+}
+
 }  // namespace
 
 TEST(MicroSpeechTest, NoFeatureTest) {
@@ -305,6 +366,38 @@ TEST(MicroSpeechTest, NoiseTest) {
   ASSERT_EQ(TestAudioSample("silence", g_noise_1000ms_audio_data,
                             g_noise_1000ms_audio_data_size),
             kTfLiteOk);
+}
+
+// Verify that a ring buffer of features is reset to zero when a keyword is
+// detected.  The test pushes frames generated from the "yes" sample through
+// a sliding window, checks for a non-silence prediction, and then ensures
+// that ZeroRingBuffer produces an all-zero buffer.
+TEST(MicroSpeechTest, RingBufferReset) {
+  Features yes_features;
+  // generate features from the 1-second yes sample
+  ASSERT_EQ(GenerateFeatures(g_yes_1000ms_audio_data,
+                             g_yes_1000ms_audio_data_size,
+                             &yes_features),
+            kTfLiteOk);
+
+  Features ring = {};
+  bool saw_keyword = false;
+  for (int frame = 0; frame < kFeatureCount; ++frame) {
+    ShiftRingBuffer(ring, yes_features[frame]);
+    int predicted = PredictCategory(ring);
+    if (predicted == 2 || predicted == 3) {
+      saw_keyword = true;
+      ZeroRingBuffer(ring);
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_keyword);
+  // after reset the ring buffer should contain only zeros
+  for (int i = 0; i < kFeatureCount; ++i) {
+    for (int j = 0; j < kFeatureSize; ++j) {
+      EXPECT_EQ(ring[i][j], 0);
+    }
+  }
 }
 
 TF_LITE_MICRO_TESTS_MAIN

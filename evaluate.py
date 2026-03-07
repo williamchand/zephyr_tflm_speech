@@ -39,6 +39,14 @@ _SAMPLE_PATH = flags.DEFINE_string(
 
 _FEATURES_SHAPE = (49, 40)
 
+# indices of keyword categories inside model output logits (silence=0, unknown=1, yes=2, no=3)
+_KEYWORD_INDICES = (2, 3)
+
+# minimum probability required to consider that a keyword has been detected
+_DETECTION_THRESHOLD = flags.DEFINE_float(
+    'detection_threshold', 0.7,
+    'Probability threshold used when scanning a ring buffer for a keyword.')
+
 
 def quantize_input_data(data, input_details):
   """quantize the input data using scale and zero point
@@ -177,11 +185,24 @@ def _main(_):
 
   tflm_interpreter = runtime.Interpreter.from_file(model_path)
 
+  # ------------------------------------------------------------------
+  # streaming-inference using a ring buffer
+  # after a keyword is detected we clear the buffer so that the "suppression"
+  # window does not contain remnants from the previous command.
+  # ------------------------------------------------------------------
+  dtype = np.float32 if audio_pp.params.use_float_output else np.int8
+  ring_buffer = np.zeros(_FEATURES_SHAPE, dtype=dtype)
+
   frame_number = 0
-  test_features = np.zeros(_FEATURES_SHAPE, dtype=np.int8)
+  print('Beginning streaming inference (ring buffer)')
   for feature in features:
-    test_features[frame_number] = feature
-    category_probabilities = predict(tflm_interpreter, test_features)
+    # advance the ring buffer and insert the newest feature frame
+    ring_buffer = np.roll(ring_buffer, -1, axis=0)
+    ring_buffer[-1] = feature
+
+    category_probabilities = predict(tflm_interpreter, ring_buffer)
+
+    # pretty-print probabilities for debug
     category_probabilities_str = '['
     for i in range(len(category_probabilities)):
       if i > 0:
@@ -189,8 +210,19 @@ def _main(_):
       category_probabilities_str += f'{category_probabilities[i]:.4f}'
     category_probabilities_str += ']'
     print(f'Frame #{frame_number}: {category_probabilities_str}')
+
+    # keyword detection / suppression reset
+    predicted_index = np.argmax(category_probabilities)
+    if (predicted_index in _KEYWORD_INDICES and
+        category_probabilities[predicted_index] >=
+        _DETECTION_THRESHOLD.value):
+      keyword = get_category_names()[predicted_index]
+      print(f"Keyword '{keyword}' detected at frame {frame_number}, resetting buffers")
+      ring_buffer.fill(0)
+
     frame_number += 1
 
+  # final single-shot prediction for comparison with old behaviour
   category_probabilities = predict(tflm_interpreter, features)
   predicted_category = np.argmax(category_probabilities)
   category_names = get_category_names()
