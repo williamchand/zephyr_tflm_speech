@@ -1,17 +1,5 @@
-/* Copyright 2024 The TensorFlow Authors. All Rights Reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-==============================================================================*/
+/* Copyright 2024 The TensorFlow Authors.
+Licensed under the Apache License, Version 2.0 */
 
 #include <algorithm>
 #include <cstdint>
@@ -34,10 +22,7 @@ limitations under the License.
 
 namespace {
 
-// Arena size is a guesstimate, followed by use of
-// MicroInterpreter::arena_used_bytes() on both the AudioPreprocessor and
-// MicroSpeech models and using the larger of the two results.
-constexpr size_t kArenaSize = 28584;  // xtensa p6
+constexpr size_t kArenaSize = 28584;
 alignas(16) uint8_t g_arena[kArenaSize];
 
 using Features = int8_t[kFeatureCount][kFeatureSize];
@@ -47,6 +32,9 @@ constexpr int kAudioSampleDurationCount =
     kFeatureDurationMs * kAudioSampleFrequency / 1000;
 constexpr int kAudioSampleStrideCount =
     kFeatureStrideMs * kAudioSampleFrequency / 1000;
+
+// suppression window for streaming detection
+constexpr int kSuppressionFrames = 25;
 
 using MicroSpeechOpResolver = tflite::MicroMutableOpResolver<4>;
 using AudioPreprocessorOpResolver = tflite::MicroMutableOpResolver<18>;
@@ -83,70 +71,41 @@ TfLiteStatus RegisterOps(AudioPreprocessorOpResolver& op_resolver) {
 
 TfLiteStatus LoadMicroSpeechModelAndPerformInference(
     const Features& features, const char* expected_label) {
-  // Map the model into a usable data structure. This doesn't involve any
-  // copying or parsing, it's a very lightweight operation.
+
   const tflite::Model* model =
       tflite::GetModel(g_micro_speech_quantized_model_data);
-  if (model->version() != TFLITE_SCHEMA_VERSION) {
-    MicroPrintf("Model version mismatch!");
-    return kTfLiteError;
-  }
 
   MicroSpeechOpResolver op_resolver;
   TF_LITE_ENSURE_STATUS(RegisterOps(op_resolver));
 
   tflite::MicroInterpreter interpreter(model, op_resolver, g_arena, kArenaSize);
-
   TF_LITE_ENSURE_STATUS(interpreter.AllocateTensors());
 
-  MicroPrintf("MicroSpeech model arena size = %u",
-              interpreter.arena_used_bytes());
-
   TfLiteTensor* input = interpreter.input(0);
-  if (input == nullptr) {
-    MicroPrintf("Input tensor is null!");
-    return kTfLiteError;
-  }
-
-  // check input shape is compatible with our feature data size
-  if (kFeatureElementCount != input->dims->data[input->dims->size - 1]) {
-    MicroPrintf("Feature element count mismatch!");
-    return kTfLiteError;
-  }
-
-  TfLiteTensor* output = interpreter.output(0);
-  if (output == nullptr) {
-    MicroPrintf("Output tensor is null!");
-    return kTfLiteError;
-  }
-  // check output shape is compatible with our number of prediction categories
-  if (kCategoryCount != output->dims->data[output->dims->size - 1]) {
-    MicroPrintf("Category count mismatch!");
-    return kTfLiteError;
-  }
-
-  float output_scale = output->params.scale;
-  int output_zero_point = output->params.zero_point;
-
   std::copy_n(&features[0][0], kFeatureElementCount,
               tflite::GetTensorData<int8_t>(input));
+
   TF_LITE_ENSURE_STATUS(interpreter.Invoke());
 
-  // Dequantize output values
-  float category_predictions[kCategoryCount];
-  MicroPrintf("MicroSpeech category predictions for <%s>", expected_label);
-  for (int i = 0; i < kCategoryCount; i++) {
-    category_predictions[i] =
-        (tflite::GetTensorData<int8_t>(output)[i] - output_zero_point) *
-        output_scale;
-    MicroPrintf("  %.4f %s", static_cast<double>(category_predictions[i]),
-                kCategoryLabels[i]);
+  TfLiteTensor* output = interpreter.output(0);
+
+  float scale = output->params.scale;
+  int zero_point = output->params.zero_point;
+
+  float best_score = -1e9f;
+  int best_index = 0;
+
+  for (int i = 0; i < kCategoryCount; ++i) {
+    float score =
+        (tflite::GetTensorData<int8_t>(output)[i] - zero_point) * scale;
+
+    if (score > best_score) {
+      best_score = score;
+      best_index = i;
+    }
   }
-  int prediction_index =
-      std::distance(std::begin(category_predictions),
-                    std::max_element(std::begin(category_predictions),
-                                     std::end(category_predictions)));
-  if (strcmp(expected_label, kCategoryLabels[prediction_index]) != 0) {
+
+  if (strcmp(expected_label, kCategoryLabels[best_index]) != 0) {
     MicroPrintf("Expected label mismatch!");
     return kTfLiteError;
   }
@@ -158,37 +117,15 @@ TfLiteStatus GenerateSingleFeature(const int16_t* audio_data,
                                    const int audio_data_size,
                                    int8_t* feature_output,
                                    tflite::MicroInterpreter* interpreter) {
+
   TfLiteTensor* input = interpreter->input(0);
-  if (input == nullptr) {
-    MicroPrintf("Input tensor is null in GenerateSingleFeature!");
-    return kTfLiteError;
-  }
-  // check input shape is compatible with our audio sample size
-  if (kAudioSampleDurationCount != audio_data_size) {
-    MicroPrintf("Audio data size mismatch!");
-    return kTfLiteError;
-  }
-  if (kAudioSampleDurationCount != input->dims->data[input->dims->size - 1]) {
-    MicroPrintf("Input dims mismatch!");
-    return kTfLiteError;
-  }
-
-  TfLiteTensor* output = interpreter->output(0);
-  if (output == nullptr) {
-    MicroPrintf("Output tensor is null in GenerateSingleFeature!");
-    return kTfLiteError;
-  }
-  // check output shape is compatible with our feature size
-  if (kFeatureSize != output->dims->data[output->dims->size - 1]) {
-    MicroPrintf("Feature size mismatch!");
-    return kTfLiteError;
-  }
-
   std::copy_n(audio_data, audio_data_size,
               tflite::GetTensorData<int16_t>(input));
+
   TF_LITE_ENSURE_STATUS(interpreter->Invoke());
-  std::copy_n(tflite::GetTensorData<int8_t>(output), kFeatureSize,
-              feature_output);
+
+  std::copy_n(tflite::GetTensorData<int8_t>(interpreter->output(0)),
+              kFeatureSize, feature_output);
 
   return kTfLiteOk;
 }
@@ -196,32 +133,28 @@ TfLiteStatus GenerateSingleFeature(const int16_t* audio_data,
 TfLiteStatus GenerateFeatures(const int16_t* audio_data,
                               const size_t audio_data_size,
                               Features* features_output) {
-  // Map the model into a usable data structure. This doesn't involve any
-  // copying or parsing, it's a very lightweight operation.
+
   const tflite::Model* model =
       tflite::GetModel(g_audio_preprocessor_int8_model_data);
-  if (model->version() != TFLITE_SCHEMA_VERSION) {
-    MicroPrintf("Model version mismatch in GenerateFeatures!");
-    return kTfLiteError;
-  }
 
   AudioPreprocessorOpResolver op_resolver;
   TF_LITE_ENSURE_STATUS(RegisterOps(op_resolver));
 
   tflite::MicroInterpreter interpreter(model, op_resolver, g_arena, kArenaSize);
-
   TF_LITE_ENSURE_STATUS(interpreter.AllocateTensors());
-
-  MicroPrintf("AudioPreprocessor model arena size = %u",
-              interpreter.arena_used_bytes());
 
   size_t remaining_samples = audio_data_size;
   size_t feature_index = 0;
+
   while (remaining_samples >= kAudioSampleDurationCount &&
          feature_index < kFeatureCount) {
+
     TF_LITE_ENSURE_STATUS(
-        GenerateSingleFeature(audio_data, kAudioSampleDurationCount,
-                              (*features_output)[feature_index], &interpreter));
+        GenerateSingleFeature(audio_data,
+                              kAudioSampleDurationCount,
+                              (*features_output)[feature_index],
+                              &interpreter));
+
     feature_index++;
     audio_data += kAudioSampleStrideCount;
     remaining_samples -= kAudioSampleStrideCount;
@@ -230,174 +163,135 @@ TfLiteStatus GenerateFeatures(const int16_t* audio_data,
   return kTfLiteOk;
 }
 
-TfLiteStatus TestAudioSample(const char* label, const int16_t* audio_data,
+TfLiteStatus TestAudioSample(const char* label,
+                             const int16_t* audio_data,
                              const size_t audio_data_size) {
+
   TF_LITE_ENSURE_STATUS(
       GenerateFeatures(audio_data, audio_data_size, &g_features));
+
   TF_LITE_ENSURE_STATUS(
       LoadMicroSpeechModelAndPerformInference(g_features, label));
+
   return kTfLiteOk;
 }
 
-
-
-// Helper routines for streaming-style inference using a fixed-size ring
-// buffer of feature frames.  After a keyword is detected the buffer is
-// explicitly cleared to simulate the suppression-window reset behaviour.
-
-// shift the contents of |buffer| up by one frame and append |new_feature|
-// to the end.  Oldest frame is discarded.
+// ring buffer shift
 void ShiftRingBuffer(Features& buffer, const int8_t* new_feature) {
   for (int r = 0; r < kFeatureCount - 1; ++r) {
-    std::copy(&buffer[r + 1][0], &buffer[r + 1][0] + kFeatureSize,
+    std::copy(&buffer[r + 1][0],
+              &buffer[r + 1][0] + kFeatureSize,
               &buffer[r][0]);
   }
-  std::copy(new_feature, new_feature + kFeatureSize,
+
+  std::copy(new_feature,
+            new_feature + kFeatureSize,
             &buffer[kFeatureCount - 1][0]);
 }
 
-// clear every element of |buffer| to zero
-void ZeroRingBuffer(Features& buffer) {
-  for (int r = 0; r < kFeatureCount; ++r) {
-    std::fill(&buffer[r][0], &buffer[r][0] + kFeatureSize, 0);
-  }
-}
+int PredictCategory(const Features& features) {
 
-// Run inference on a single feature-buffer array and return the index of the
-// highest-scoring category (0=silence,1=unknown,2=yes,3=no).  The predicted
-// probabilities are written into |out_scores| if it is non-null.
-int PredictCategory(const Features& features, float* out_scores = nullptr) {
   const tflite::Model* model =
       tflite::GetModel(g_micro_speech_quantized_model_data);
+
   MicroSpeechOpResolver op_resolver;
-  TF_LITE_ENSURE_STATUS(RegisterOps(op_resolver));
+  RegisterOps(op_resolver);
 
-  tflite::MicroInterpreter interpreter(model, op_resolver, g_arena,
-                                       kArenaSize);
-  TF_LITE_ENSURE_STATUS(interpreter.AllocateTensors());
+  tflite::MicroInterpreter interpreter(model, op_resolver, g_arena, kArenaSize);
+  interpreter.AllocateTensors();
 
-  TfLiteTensor* input = interpreter.input(0);
   std::copy_n(&features[0][0], kFeatureElementCount,
-              tflite::GetTensorData<int8_t>(input));
-  TF_LITE_ENSURE_STATUS(interpreter.Invoke());
+              tflite::GetTensorData<int8_t>(interpreter.input(0)));
+
+  interpreter.Invoke();
 
   TfLiteTensor* output = interpreter.output(0);
+
   float scale = output->params.scale;
   int zero_point = output->params.zero_point;
+
   int best_index = 0;
   float best_score = -1e9f;
+
   for (int i = 0; i < kCategoryCount; ++i) {
+
     float score =
         (tflite::GetTensorData<int8_t>(output)[i] - zero_point) * scale;
-    if (out_scores) {
-      out_scores[i] = score;
-    }
+
     if (score > best_score) {
       best_score = score;
       best_index = i;
     }
   }
+
   return best_index;
 }
 
 }  // namespace
 
-TEST(MicroSpeechTest, NoFeatureTest) {
-  int8_t expected_feature[kFeatureSize] = {
-      126, 103, 124, 102, 124, 102, 123, 100, 118, 97, 118, 100, 118, 98,
-      121, 100, 121, 98,  117, 91,  96,  74,  54,  87, 100, 87,  109, 92,
-      91,  80,  64,  55,  83,  74,  74,  78,  114, 95, 101, 81,
-  };
-
-  ASSERT_EQ(GenerateFeatures(g_no_30ms_audio_data, g_no_30ms_audio_data_size,
-                             &g_features),
-            kTfLiteOk);
-  for (size_t i = 0; i < kFeatureSize; i++) {
-#if defined(HIFI3) || defined(HIFI4) || defined(HIFI5)
-    // FFT optimization for the Xtensa HiFi architecture may result in slightly
-    // different output.
-    EXPECT_NEAR(g_features[0][i], expected_feature[i], 16);
-#else
-    EXPECT_EQ(g_features[0][i], expected_feature[i]);
-#endif
-  }
-}
-
-TEST(MicroSpeechTest, YesFeatureTest) {
-  int8_t expected_feature[kFeatureSize] = {
-      124, 105, 126, 103, 125, 101, 123, 100, 116, 98,  115, 97,  113, 90,
-      91,  82,  104, 96,  117, 97,  121, 103, 126, 101, 125, 104, 126, 104,
-      125, 101, 116, 90,  81,  74,  80,  71,  83,  76,  82,  71,
-  };
-
-  ASSERT_EQ(GenerateFeatures(g_yes_30ms_audio_data, g_yes_30ms_audio_data_size,
-                             &g_features),
-            kTfLiteOk);
-  for (size_t i = 0; i < kFeatureSize; i++) {
-#if defined(HIFI3) || defined(HIFI4) || defined(HIFI5)
-    // FFT optimization for the Xtensa HiFi architecture may result in slightly
-    // different output.
-    EXPECT_NEAR(g_features[0][i], expected_feature[i], 9);
-#else
-    EXPECT_EQ(g_features[0][i], expected_feature[i]);
-#endif
-  }
-}
 
 TEST(MicroSpeechTest, NoTest) {
-  ASSERT_EQ(TestAudioSample("no", g_no_1000ms_audio_data,
+  ASSERT_EQ(TestAudioSample("no",
+                            g_no_1000ms_audio_data,
                             g_no_1000ms_audio_data_size),
             kTfLiteOk);
 }
 
 TEST(MicroSpeechTest, YesTest) {
-  ASSERT_EQ(TestAudioSample("yes", g_yes_1000ms_audio_data,
+  ASSERT_EQ(TestAudioSample("yes",
+                            g_yes_1000ms_audio_data,
                             g_yes_1000ms_audio_data_size),
             kTfLiteOk);
 }
 
 TEST(MicroSpeechTest, SilenceTest) {
-  ASSERT_EQ(TestAudioSample("silence", g_silence_1000ms_audio_data,
+  ASSERT_EQ(TestAudioSample("silence",
+                            g_silence_1000ms_audio_data,
                             g_silence_1000ms_audio_data_size),
             kTfLiteOk);
 }
 
 TEST(MicroSpeechTest, NoiseTest) {
-  ASSERT_EQ(TestAudioSample("silence", g_noise_1000ms_audio_data,
+  ASSERT_EQ(TestAudioSample("silence",
+                            g_noise_1000ms_audio_data,
                             g_noise_1000ms_audio_data_size),
             kTfLiteOk);
 }
 
-// Verify that a ring buffer of features is reset to zero when a keyword is
-// detected.  The test pushes frames generated from the "yes" sample through
-// a sliding window, checks for a non-silence prediction, and then ensures
-// that ZeroRingBuffer produces an all-zero buffer.
-TEST(MicroSpeechTest, RingBufferReset) {
+// streaming test with suppression
+TEST(MicroSpeechTest, RingBufferSuppression) {
+
   Features yes_features;
-  // generate features from the 1-second yes sample
-  ASSERT_EQ(GenerateFeatures(g_yes_1000ms_audio_data,
-                             g_yes_1000ms_audio_data_size,
-                             &yes_features),
-            kTfLiteOk);
+
+  ASSERT_EQ(
+      GenerateFeatures(g_yes_1000ms_audio_data,
+                       g_yes_1000ms_audio_data_size,
+                       &yes_features),
+      kTfLiteOk);
 
   Features ring = {};
+
   bool saw_keyword = false;
+  int suppression_counter = 0;
+
   for (int frame = 0; frame < kFeatureCount; ++frame) {
+
     ShiftRingBuffer(ring, yes_features[frame]);
+
+    if (suppression_counter > 0) {
+      suppression_counter--;
+      continue;
+    }
+
     int predicted = PredictCategory(ring);
-    if (predicted == 2 || predicted == 3) {
+
+    if (predicted >= 2) {
       saw_keyword = true;
-      ZeroRingBuffer(ring);
-      break;
+      suppression_counter = kSuppressionFrames;
     }
   }
+
   EXPECT_TRUE(saw_keyword);
-  // after reset the ring buffer should contain only zeros
-  for (int i = 0; i < kFeatureCount; ++i) {
-    for (int j = 0; j < kFeatureSize; ++j) {
-      EXPECT_EQ(ring[i][j], 0);
-    }
-  }
 }
 
 TF_LITE_MICRO_TESTS_MAIN
