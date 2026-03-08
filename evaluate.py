@@ -11,9 +11,7 @@ from tensorflow.python.platform import resource_loader
 import tensorflow as tf
 from tflite_micro.tensorflow.lite.micro.examples.micro_speech import audio_preprocessor
 
-SUPPRESSION_FRAMES = 40
-SILENCE_ENERGY_THRESHOLD = 0.005
-MIN_DETECTION_FRAMES = 4
+
 _SAMPLE_PATH = flags.DEFINE_string(
     name='sample_path',
     default='',
@@ -24,9 +22,9 @@ _FEATURES_SHAPE = (49, 40)
 
 _DETECTION_THRESHOLD = flags.DEFINE_float(
     'detection_threshold', 0.7,
-    'Probability threshold used for keyword detection.')
+    'Probability threshold used for keyword detection.'
+)
 
-# label order derived from training configuration
 CATEGORY_NAMES = [
     "silence",
     "unknown",
@@ -127,6 +125,16 @@ def generate_features(audio_pp):
 
   return features
 
+
+def shift_ring_buffer(buffer, new_feature):
+  buffer[:-1] = buffer[1:]
+  buffer[-1] = new_feature
+
+
+def zero_ring_buffer(buffer):
+  buffer[:] = 0
+
+
 def _main(_):
 
   sample_path = Path(_SAMPLE_PATH.value)
@@ -150,12 +158,7 @@ def _main(_):
 
   ring_buffer = np.zeros(_FEATURES_SHAPE, dtype=dtype)
 
-  ring_index = 0
   frame_number = 0
-
-  suppression_counter = 0
-  stable_count = 0
-
   detected_label = "silence"
   detected_prob = 0.0
 
@@ -163,60 +166,30 @@ def _main(_):
 
   for feature in features:
 
-    # compute energy gate
-    frame_energy = np.mean(np.abs(feature))
+    # shift buffer and append new frame
+    shift_ring_buffer(ring_buffer, feature)
 
-    if frame_energy < SILENCE_ENERGY_THRESHOLD:
-        frame_number += 1
-        continue
-
-    # insert frame into ring buffer
-    ring_buffer[ring_index] = feature
-    ring_index = (ring_index + 1) % _FEATURES_SHAPE[0]
-
-    ordered_features = np.concatenate(
-        (ring_buffer[ring_index:], ring_buffer[:ring_index]),
-        axis=0
-    )
-
-    probabilities = predict(interpreter, ordered_features)
+    probabilities = predict(interpreter, ring_buffer)
 
     predicted_index = np.argmax(probabilities)
     probability = probabilities[predicted_index]
 
     label = CATEGORY_NAMES[predicted_index]
 
-    # reduce suppression timer
-    if suppression_counter > 0:
-        suppression_counter -= 1
-
-    # stability check
     if predicted_index >= 2 and probability >= _DETECTION_THRESHOLD.value:
-        stable_count += 1
-    else:
-        stable_count = 0
 
-    # trigger detection only if stable
-    if (
-        stable_count >= MIN_DETECTION_FRAMES
-        and suppression_counter == 0
-    ):
+      print(
+          f"Detected '{label}' "
+          f"(prob={probability:.2f}) "
+          f"at frame {frame_number}"
+      )
 
-        print(
-            f"Detected '{label}' "
-            f"(prob={probability:.2f}) "
-            f"at frame {frame_number}"
-        )
+      detected_label = label
+      detected_prob = probability
 
-        detected_label = label
-        detected_prob = probability
+      zero_ring_buffer(ring_buffer)
 
-        suppression_counter = SUPPRESSION_FRAMES
-        stable_count = 0
-
-        # reset ring buffer
-        ring_buffer.fill(0)
-        ring_index = 0
+      break
 
     frame_number += 1
 
@@ -225,6 +198,7 @@ def _main(_):
       detected_label,
       f"(prob={detected_prob:.2f})"
   )
+
 
 if __name__ == '__main__':
   app.run(_main)
