@@ -124,7 +124,6 @@ def generate_features(audio_pp):
 
   return features
 
-
 def _main(_):
 
   sample_path = Path(_SAMPLE_PATH.value)
@@ -147,26 +146,38 @@ def _main(_):
 
   dtype = np.float32 if audio_pp.params.use_float_output else np.int8
 
+  # zero-copy ring buffer
   ring_buffer = np.zeros(_FEATURES_SHAPE, dtype=dtype)
 
+  ring_index = 0
   frame_number = 0
+
+  detected_label = "silence"
+  detected_prob = 0.0
 
   print("Streaming inference started")
 
   for feature in features:
 
-    ring_buffer = np.roll(ring_buffer, -1, axis=0)
-    ring_buffer[-1] = feature
+    # insert new frame into ring buffer
+    ring_buffer[ring_index] = feature
+    ring_index = (ring_index + 1) % _FEATURES_SHAPE[0]
 
-    probabilities = predict(interpreter, ring_buffer)
+    # reconstruct ordered feature window
+    ordered_features = np.concatenate(
+        (ring_buffer[ring_index:], ring_buffer[:ring_index]),
+        axis=0
+    )
+
+    probabilities = predict(interpreter, ordered_features)
 
     predicted_index = np.argmax(probabilities)
     probability = probabilities[predicted_index]
 
-    # ignore silence and unknown
-    if predicted_index >= 2 and probability >= _DETECTION_THRESHOLD.value:
+    label = CATEGORY_NAMES[predicted_index]
 
-      label = CATEGORY_NAMES[predicted_index]
+    # detection
+    if predicted_index >= 2 and probability >= _DETECTION_THRESHOLD.value:
 
       print(
           f"Detected '{label}' "
@@ -174,22 +185,25 @@ def _main(_):
           f"at frame {frame_number}"
       )
 
-      # reset ring buffer to simulate suppression
+      detected_label = label
+      detected_prob = probability
+
+      # reset ring buffer after detection
       ring_buffer.fill(0)
+      ring_index = 0
+
+    # reset detection when silence appears
+    if label == "silence":
+      detected_label = "silence"
+      detected_prob = probability
 
     frame_number += 1
 
-  # final single inference
-  probabilities = predict(interpreter, features)
-
-  predicted_index = np.argmax(probabilities)
-
   print(
       "Final prediction:",
-      CATEGORY_NAMES[predicted_index],
-      f"(prob={probabilities[predicted_index]:.2f})"
+      detected_label,
+      f"(prob={detected_prob:.2f})"
   )
-
 
 if __name__ == '__main__':
   app.run(_main)
