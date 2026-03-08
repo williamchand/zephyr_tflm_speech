@@ -11,6 +11,9 @@ REPO_ROOT = Path(__file__).parent.parent.resolve()
 TFLM = REPO_ROOT / "tflite_micro/tensorflow/lite/micro/examples/micro_speech"
 
 FILES_TO_LINK = [
+    (REPO_ROOT / "micro_model_settings.h",
+     TFLM / "micro_model_settings.h"),
+
     (REPO_ROOT / "micro_speech_test.cc",
      TFLM / "micro_speech_test.cc"),
 
@@ -19,6 +22,9 @@ FILES_TO_LINK = [
 
     (REPO_ROOT / "evaluate_test.py",
      TFLM / "evaluate_test.py"),
+
+    (REPO_ROOT / "models/micro_speech_quantized.tflite",
+     TFLM / "models/micro_speech_quantized.tflite"),
 
     (REPO_ROOT / "train/train_micro_speech_model.ipynb",
      TFLM / "train/train_micro_speech_model.ipynb"),
