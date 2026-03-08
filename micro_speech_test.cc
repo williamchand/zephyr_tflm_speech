@@ -54,7 +54,7 @@ using AudioPreprocessorOpResolver = tflite::MicroMutableOpResolver<18>;
 TfLiteStatus RegisterOps(MicroSpeechOpResolver& op_resolver) {
   TF_LITE_ENSURE_STATUS(op_resolver.AddReshape());
   TF_LITE_ENSURE_STATUS(op_resolver.AddFullyConnected());
-  TF_LITE_ENSURE_STATUS(op_resolver.AddDepthwiseConv2D());
+  TF_LITE_ENSURE_STATUS(op_resolver.AddConv2D());
   TF_LITE_ENSURE_STATUS(op_resolver.AddSoftmax());
   return kTfLiteOk;
 }
