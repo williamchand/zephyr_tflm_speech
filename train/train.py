@@ -75,6 +75,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_url", type=str, default="")
     parser.add_argument("--data_dir", type=str, default="./speech_dataset")
+    parser.add_argument("--train_dir", type=str, default="train/")  # checkpoint dir
     parser.add_argument("--wanted_words", type=str,
                         default="yes,no,up,down,left,right,on,off,stop,go")
     parser.add_argument("--validation_percentage", type=int, default=10)
@@ -94,6 +95,7 @@ def main():
     parser.add_argument("--background_volume", type=float, default=0.1)
     parser.add_argument("--time_shift_ms", type=float, default=100.0)
     parser.add_argument("--preprocess", type=str, default="mfcc")
+    parser.add_argument("--save_step_interval", type=int, default=1000)  # checkpoint interval
     FLAGS = parser.parse_args()
 
     # Prepare words list
@@ -145,6 +147,12 @@ def main():
     train_acc = tf.keras.metrics.SparseCategoricalAccuracy()
     val_acc = tf.keras.metrics.SparseCategoricalAccuracy()
 
+    # Prepare checkpoint
+    checkpoint_dir = FLAGS.train_dir
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    ckpt = tf.train.Checkpoint(step=tf.Variable(0), optimizer=optimizer, model=model)
+    ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_dir, max_to_keep=5)
+
     step, stage, stage_steps = 0, 0, training_steps_list[0]
 
     print("Starting training...")
@@ -164,6 +172,12 @@ def main():
         grads = tape.gradient(loss, model.trainable_variables)
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
         train_acc.update_state(labels, logits)
+
+        # Save checkpoint
+        if step % FLAGS.save_step_interval == 0:
+            ckpt.step.assign(step)
+            ckpt_manager.save()
+            print(f"Checkpoint saved at step {step}")
 
         if step % 100 == 0:
             print(f"Step {step} | Loss {loss:.4f} | Train Acc {train_acc.result().numpy()*100:.2f}%")
