@@ -18,22 +18,17 @@ TF2 + CPU-optimised version.  Public API is identical to the original TF1
 file — all method signatures, including the unused `sess` parameter, are
 preserved exactly.
 
-Performance improvements over the previous TF2 draft
------------------------------------------------------
-1. `get_data()` is now backed by a `tf.data` pipeline that runs file I/O,
-   augmentation, and feature extraction in a parallel C++ thread-pool
-   (`num_parallel_calls=AUTOTUNE`) and prefetches results, instead of
-   processing samples one-by-one in a Python for-loop.
+Bug fix vs previous version
+----------------------------
+Defining a `@tf.function` inside `get_data()` caused TF to re-trace on every
+call with wrong static shapes, producing the error:
+  "Incompatible shapes at component 0: expected [?,0] but got [100,1960]"
 
-2. Background noise clips are pre-stacked into a single `tf.constant` tensor
-   once at construction time (`_background_tensor`), so every training step
-   can pick a random clip with a single gather op instead of a Python index.
-
-3. The per-sample audio processing function (`_process_audio`) is compiled
-   with `@tf.function` and reused across both `get_data()` and
-   `get_features_for_wav()`.
-
-4. `get_unprocessed_data()` uses the same parallel `tf.data` pattern.
+The fix is to compile `_process_one` **once** in `prepare_processing_graph()`
+with an explicit `input_signature`, store it as `self._process_one`, and reuse
+it across all `get_data()` calls.  Background augmentation parameters that
+change per-call (frequency, volume, time-shift) are fed as scalar tensors at
+call time rather than baked into the closure.
 """
 import hashlib
 import math
@@ -222,13 +217,8 @@ class AudioProcessor:
     # ------------------------------------------------------------------
 
     def prepare_background_data(self):
-        """Load background noise clips and cache as a stacked numpy array.
-
-        `_background_tensor` is built lazily on the first `get_data()` call
-        once `desired_samples` is known.
-        """
         self.background_data = []
-        self._background_tensor = None   # built lazily in _ensure_background_tensor
+        self._background_tensor = None  # built lazily once desired_samples is known
 
         bg_dir = os.path.join(self.data_dir, BACKGROUND_NOISE_DIR_NAME)
         if not gfile.Exists(bg_dir):
@@ -258,17 +248,22 @@ class AudioProcessor:
                     'Background clip too short (%d < %d samples)'
                     % (len(bg), desired_samples))
             clips.append(bg[:desired_samples].astype(np.float32))
-        # Shape: [N_clips, desired_samples] — lives in C++ memory, zero-copy
-        # inside tf.function gather calls.
         self._background_tensor = tf.constant(
-            np.stack(clips), dtype=tf.float32)
+            np.stack(clips), dtype=tf.float32)   # [N_clips, desired_samples]
 
     # ------------------------------------------------------------------
-    # Processing graph
+    # Processing graph  — compiled ONCE, reused everywhere
     # ------------------------------------------------------------------
 
     def prepare_processing_graph(self, model_settings, summaries_dir):
-        """Compile the per-sample feature-extraction tf.function once."""
+        """Compile _process_audio and _process_one tf.functions once.
+
+        KEY FIX: both functions are built here with explicit input_signature
+        so TF traces them exactly once with the correct concrete shapes.
+        Redefining a @tf.function inside get_data() caused shape-inference
+        failures because TF re-traced with symbolic [None] shapes on every
+        Python call.
+        """
         self._model_settings = model_settings
 
         self.summary_writer_ = None
@@ -281,14 +276,24 @@ class AudioProcessor:
         window_size     = model_settings['window_size_samples']
         window_stride   = model_settings['window_stride_samples']
         fp_width        = model_settings['fingerprint_width']
+        fp_size         = model_settings['fingerprint_size']
         avg_win         = model_settings.get('average_window_width', -1)
         sample_rate     = model_settings['sample_rate']
 
-        @tf.function
+        # ---- _process_audio: augment + feature-extract one clip ----------
+        #
+        # input_signature pins every tensor shape so TF traces exactly once.
+        @tf.function(input_signature=[
+            tf.TensorSpec([desired_samples, 1], tf.float32),   # foreground
+            tf.TensorSpec([desired_samples, 1], tf.float32),   # background
+            tf.TensorSpec([], tf.float32),                     # bg_volume
+            tf.TensorSpec([], tf.float32),                     # fg_volume
+            tf.TensorSpec([2, 2], tf.int32),                   # time_shift_padding
+            tf.TensorSpec([2],    tf.int32),                   # time_shift_offset
+        ])
         def _process_audio(foreground, background_data,
                             background_volume, foreground_volume,
                             time_shift_padding, time_shift_offset):
-            """Augment one clip and return a flat feature vector."""
             scaled = tf.multiply(foreground, foreground_volume)
             padded = tf.pad(scaled, time_shift_padding, mode='CONSTANT')
             sliced = tf.slice(padded, time_shift_offset, [desired_samples, -1])
@@ -325,9 +330,109 @@ class AudioProcessor:
             else:
                 raise ValueError('Unknown preprocess mode "%s"' % preprocess)
 
-            return tf.reshape(output, [-1])
+            # Returns a flat vector of known size [fp_size].
+            return tf.reshape(output, [fp_size])
 
         self._process_audio = _process_audio
+        self._fp_size = fp_size
+        self._desired_samples = desired_samples
+
+        # ---- _process_one: load + augment one (path, label, flags) row ---
+        #
+        # augmentation scalars (bg_frequency, bg_volume_range, time_shift,
+        # use_background) vary per get_data() call, so they are passed as
+        # scalar tensors rather than Python-level closure variables.  This
+        # lets us reuse ONE compiled function for training, validation, and
+        # testing without retracing.
+        #
+        # Signature:
+        #   wav_path        tf.string  scalar
+        #   label           tf.int32   scalar
+        #   silence_flag    tf.int32   scalar  (1 = silence sample)
+        #   bg_tensor       tf.float32 [N_bg, desired_samples]
+        #   bg_frequency    tf.float32 scalar
+        #   bg_volume_range tf.float32 scalar
+        #   time_shift      tf.int32   scalar
+        #   use_background  tf.bool    scalar
+        #
+        # Returns: (features [fp_size], label scalar int32)
+        #
+        # NOTE: bg_tensor shape has a dynamic first dim (N_bg) so we leave
+        # that axis as None in the TensorSpec.
+
+        @tf.function(input_signature=[
+            tf.TensorSpec([], tf.string),                           # wav_path
+            tf.TensorSpec([], tf.int32),                            # label
+            tf.TensorSpec([], tf.int32),                            # silence_flag
+            tf.TensorSpec([None, desired_samples], tf.float32),     # bg_tensor
+            tf.TensorSpec([], tf.float32),                          # bg_frequency
+            tf.TensorSpec([], tf.float32),                          # bg_volume_range
+            tf.TensorSpec([], tf.int32),                            # time_shift
+            tf.TensorSpec([], tf.bool),                             # use_background
+        ])
+        def _process_one(wav_path, label, silence_flag,
+                         bg_tensor, bg_frequency, bg_volume_range,
+                         time_shift, use_background):
+            # Load wav
+            audio, _ = tf.audio.decode_wav(
+                tf.io.read_file(wav_path),
+                desired_channels=1, desired_samples=desired_samples)
+            # audio: [desired_samples, 1]
+
+            # Time shift
+            shift = tf.cond(
+                tf.greater(time_shift, 0),
+                lambda: tf.random.uniform(
+                    [], -time_shift, time_shift, dtype=tf.int32),
+                lambda: tf.constant(0, tf.int32))
+            pad_l   = tf.maximum(shift, 0)
+            pad_r   = tf.maximum(-shift, 0)
+            padding = tf.stack([[pad_l, pad_r], [0, 0]])   # [2,2]
+            t_off   = tf.stack([pad_r, 0])                 # [2]
+
+            # Background noise
+            n_bg    = tf.shape(bg_tensor)[0]
+            bg_idx  = tf.random.uniform([], 0, n_bg, dtype=tf.int32)
+            bg_clip = tf.reshape(bg_tensor[bg_idx], [desired_samples, 1])
+
+            bg_vol = tf.cond(
+                use_background,
+                true_fn=lambda: tf.cond(
+                    tf.equal(silence_flag, 1),
+                    true_fn=lambda: tf.random.uniform([], 0.0, 1.0),
+                    false_fn=lambda: tf.cond(
+                        tf.less(tf.random.uniform([]), bg_frequency),
+                        true_fn=lambda: tf.random.uniform(
+                            [], 0.0, bg_volume_range),
+                        false_fn=lambda: tf.constant(0.0))),
+                false_fn=lambda: tf.constant(0.0))
+
+            fg_vol = tf.cond(
+                tf.equal(silence_flag, 1),
+                lambda: tf.constant(0.0),
+                lambda: tf.constant(1.0))
+
+            features = _process_audio(
+                audio, bg_clip, bg_vol, fg_vol, padding, t_off)
+            return features, tf.cast(label, tf.int32)
+
+        self._process_one = _process_one
+
+        # ---- _load_one: raw unaugmented load for get_unprocessed_data ----
+        @tf.function(input_signature=[
+            tf.TensorSpec([], tf.string),
+            tf.TensorSpec([], tf.int32),
+        ])
+        def _load_one(wav_path, silence_flag):
+            audio, _ = tf.audio.decode_wav(
+                tf.io.read_file(wav_path),
+                desired_channels=1, desired_samples=desired_samples)
+            vol = tf.cond(tf.equal(silence_flag, 1),
+                          lambda: tf.constant(0.0),
+                          lambda: tf.constant(1.0))
+            return tf.reshape(audio * vol, [desired_samples])
+
+        self._load_one = _load_one
 
     # ------------------------------------------------------------------
     # Public API
@@ -342,33 +447,25 @@ class AudioProcessor:
                  background_volume_range, time_shift, mode, sess=None):
         """Return (fingerprints, labels) via a parallel tf.data pipeline.
 
-        Signature is identical to the original TF1 version.  `sess` is
-        accepted but ignored.
-
-        The internal implementation replaces the single-threaded Python loop
-        with a `tf.data.Dataset` that maps `_process_one` (file I/O +
-        augment + features) across `tf.data.AUTOTUNE` parallel threads and
-        prefetches the assembled batch.
+        Signature identical to the original TF1 version.  `sess` is ignored.
 
         Returns:
           data   – np.ndarray [sample_count, fingerprint_size] float32
           labels – np.ndarray [sample_count] int32
         """
         candidates      = self.data_index[mode]
-        desired_samples = model_settings['desired_samples']
-        fp_size         = model_settings['fingerprint_size']
+        desired_samples = self._desired_samples
+        fp_size         = self._fp_size
 
-        # Lazily build stacked background tensor now that desired_samples is known.
         self._ensure_background_tensor(desired_samples)
 
-        # --- Determine which samples to process ---
+        # Determine which samples to process
         if how_many == -1:
             sample_count = len(candidates)
             indices = list(range(len(candidates)))
         else:
             sample_count = max(0, min(how_many, len(candidates) - offset))
             if mode == 'training':
-                # Random draw — same semantics as original.
                 indices = np.random.randint(
                     0, len(candidates), size=sample_count).tolist()
             else:
@@ -385,64 +482,32 @@ class AudioProcessor:
                          for i in indices]
 
         use_background = bool(self.background_data) and (mode == 'training')
-        bg_tensor      = self._background_tensor          # [N_bg, desired_samples]
-        n_bg           = int(bg_tensor.shape[0])
 
-        # Scalar Python values captured once per call — not per sample.
-        bg_frequency    = float(background_frequency)
-        bg_vol_range    = float(background_volume_range)
-        time_shift_samp = int(time_shift)
-        process_audio   = self._process_audio             # compiled tf.function
+        # These scalar tensors are passed *into* the compiled _process_one
+        # function so TF doesn't need to retrace for different call-site values.
+        bg_tensor_t    = self._background_tensor
+        bg_frequency_t = tf.constant(float(background_frequency),    tf.float32)
+        bg_vol_range_t = tf.constant(float(background_volume_range),  tf.float32)
+        time_shift_t   = tf.constant(int(time_shift),                 tf.int32)
+        use_bg_t       = tf.constant(use_background,                  tf.bool)
 
-        @tf.function
-        def _process_one(wav_path, label, silence_flag):
-            # Load
-            audio, _ = tf.audio.decode_wav(
-                tf.io.read_file(wav_path),
-                desired_channels=1, desired_samples=desired_samples)
+        process_one = self._process_one   # pre-compiled, do NOT redefine here
 
-            # Time shift
-            if time_shift_samp > 0:
-                shift = tf.random.uniform(
-                    [], -time_shift_samp, time_shift_samp, dtype=tf.int32)
-            else:
-                shift = tf.constant(0, tf.int32)
-            pad_l   = tf.maximum(shift, 0)
-            pad_r   = tf.maximum(-shift, 0)
-            padding = tf.stack([[pad_l, pad_r], [0, 0]])
-            t_off   = tf.stack([pad_r, 0])
+        def _map_fn(wav_path, label, silence_flag):
+            # Thin wrapper: forwards the per-call scalars that are constant
+            # within this dataset but can't be put in input_signature
+            # because they differ between training/validation calls.
+            return process_one(
+                wav_path, label, silence_flag,
+                bg_tensor_t, bg_frequency_t, bg_vol_range_t,
+                time_shift_t, use_bg_t)
 
-            # Background
-            if use_background:
-                bg_idx  = tf.random.uniform([], 0, n_bg, dtype=tf.int32)
-                bg_clip = tf.reshape(bg_tensor[bg_idx], [desired_samples, 1])
-                bg_vol  = tf.cond(
-                    tf.equal(silence_flag, 1),
-                    true_fn=lambda: tf.random.uniform([], 0.0, 1.0),
-                    false_fn=lambda: tf.cond(
-                        tf.less(tf.random.uniform([]), bg_frequency),
-                        true_fn=lambda: tf.random.uniform([], 0.0, bg_vol_range),
-                        false_fn=lambda: tf.constant(0.0)))
-            else:
-                bg_clip = tf.zeros([desired_samples, 1], tf.float32)
-                bg_vol  = tf.constant(0.0)
-
-            fg_vol = tf.cond(
-                tf.equal(silence_flag, 1),
-                lambda: tf.constant(0.0),
-                lambda: tf.constant(1.0))
-
-            features = process_audio(audio, bg_clip, bg_vol, fg_vol,
-                                     padding, t_off)
-            return features, tf.cast(label, tf.int32)
-
-        # Build and run the pipeline — all parallel work happens in C++.
         ds = tf.data.Dataset.from_tensor_slices((
             tf.constant(files),
             tf.constant(word_indices,  dtype=tf.int32),
             tf.constant(silence_flags, dtype=tf.int32),
         ))
-        ds = ds.map(_process_one,
+        ds = ds.map(_map_fn,
                     num_parallel_calls=tf.data.AUTOTUNE,
                     deterministic=(mode != 'training'))
         ds = ds.batch(sample_count).prefetch(1)
@@ -454,7 +519,7 @@ class AudioProcessor:
 
     def get_features_for_wav(self, wav_filename, model_settings, sess=None):
         """Extract features from a single WAV file.  `sess` is ignored."""
-        desired_samples = model_settings['desired_samples']
+        desired_samples = self._desired_samples
         raw     = io_ops.read_file(wav_filename)
         decoded = tf.audio.decode_wav(
             raw, desired_channels=1, desired_samples=desired_samples)
@@ -473,7 +538,7 @@ class AudioProcessor:
     def get_unprocessed_data(self, how_many, model_settings, mode):
         """Return raw (unaugmented) audio arrays.  No `sess` needed."""
         candidates      = self.data_index[mode]
-        desired_samples = model_settings['desired_samples']
+        desired_samples = self._desired_samples
         sample_count    = len(candidates) if how_many == -1 else how_many
 
         if mode == 'training' and how_many != -1:
@@ -488,21 +553,13 @@ class AudioProcessor:
         label_indices = [self.word_to_index[candidates[i]['label']]
                          for i in indices]
 
-        @tf.function
-        def _load_one(wav_path, silence_flag):
-            audio, _ = tf.audio.decode_wav(
-                tf.io.read_file(wav_path),
-                desired_channels=1, desired_samples=desired_samples)
-            vol = tf.cond(tf.equal(silence_flag, 1),
-                          lambda: tf.constant(0.0),
-                          lambda: tf.constant(1.0))
-            return tf.reshape(audio * vol, [desired_samples])
+        load_one = self._load_one   # pre-compiled, do NOT redefine
 
         ds = tf.data.Dataset.from_tensor_slices((
             tf.constant(files),
             tf.constant(silence_flags, dtype=tf.int32),
         ))
-        ds = ds.map(_load_one, num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.map(load_one, num_parallel_calls=tf.data.AUTOTUNE)
         ds = ds.batch(sample_count).prefetch(1)
 
         for audio_batch in ds:
