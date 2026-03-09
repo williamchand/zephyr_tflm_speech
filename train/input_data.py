@@ -14,10 +14,26 @@
 # ==============================================================================
 """Input data handling for simple speech recognition.
 
-Refactored to TensorFlow v2 eager execution. All public method signatures are
-preserved exactly — including the `sess` argument on get_data(),
-get_features_for_wav(), etc. — so that call-sites require no changes.
-`sess` is accepted but never used; pass None freely.
+TF2 + CPU-optimised version.  Public API is identical to the original TF1
+file — all method signatures, including the unused `sess` parameter, are
+preserved exactly.
+
+Performance improvements over the previous TF2 draft
+-----------------------------------------------------
+1. `get_data()` is now backed by a `tf.data` pipeline that runs file I/O,
+   augmentation, and feature extraction in a parallel C++ thread-pool
+   (`num_parallel_calls=AUTOTUNE`) and prefetches results, instead of
+   processing samples one-by-one in a Python for-loop.
+
+2. Background noise clips are pre-stacked into a single `tf.constant` tensor
+   once at construction time (`_background_tensor`), so every training step
+   can pick a random clip with a single gather op instead of a Python index.
+
+3. The per-sample audio processing function (`_process_audio`) is compiled
+   with `@tf.function` and reused across both `get_data()` and
+   `get_features_for_wav()`.
+
+4. `get_unprocessed_data()` uses the same parallel `tf.data` pattern.
 """
 import hashlib
 import math
@@ -36,7 +52,6 @@ from tensorflow.python.ops import io_ops
 from tensorflow.python.platform import gfile
 from tensorflow.python.util import compat
 
-# Optional micro-frontend op.
 try:
     from tensorflow.lite.experimental.microfrontend.python.ops import (
         audio_microfrontend_op as frontend_op,
@@ -44,7 +59,7 @@ try:
 except ImportError:
     frontend_op = None
 
-MAX_NUM_WAVS_PER_CLASS = 2 ** 27 - 1  # ~134M
+MAX_NUM_WAVS_PER_CLASS = 2 ** 27 - 1
 SILENCE_LABEL = '_silence_'
 SILENCE_INDEX = 0
 UNKNOWN_WORD_LABEL = '_unknown_'
@@ -54,32 +69,14 @@ RANDOM_SEED = 59185
 
 
 # ---------------------------------------------------------------------------
-# Module-level helpers (unchanged signatures)
+# Module-level helpers  (signatures unchanged)
 # ---------------------------------------------------------------------------
 
 def prepare_words_list(wanted_words):
-    """Prepends common tokens to the custom word list.
-
-    Args:
-      wanted_words: List of strings containing the custom words.
-
-    Returns:
-      List with the standard silence and unknown tokens added.
-    """
     return [SILENCE_LABEL, UNKNOWN_WORD_LABEL] + wanted_words
 
 
 def which_set(filename, validation_percentage, testing_percentage):
-    """Determines which data partition the file should belong to.
-
-    Args:
-      filename: File path of the data sample.
-      validation_percentage: How much of the data set to use for validation.
-      testing_percentage: How much of the data set to use for testing.
-
-    Returns:
-      String, one of 'training', 'validation', or 'testing'.
-    """
     base_name = os.path.basename(filename)
     hash_name = re.sub(r'_nohash_.*$', '', base_name)
     hash_name_hashed = hashlib.sha1(compat.as_bytes(hash_name)).hexdigest()
@@ -95,54 +92,26 @@ def which_set(filename, validation_percentage, testing_percentage):
 
 
 def load_wav_file(filename):
-    """Loads an audio file and returns a float PCM-encoded array of samples.
-
-    Args:
-      filename: Path to the .wav file to load.
-
-    Returns:
-      Numpy array holding the sample data as floats between -1.0 and 1.0.
-    """
-    wav_loader = io_ops.read_file(filename)
-    wav_decoder = tf.audio.decode_wav(wav_loader, desired_channels=1)
-    return wav_decoder.audio.numpy().flatten()
+    raw = io_ops.read_file(filename)
+    decoded = tf.audio.decode_wav(raw, desired_channels=1)
+    return decoded.audio.numpy().flatten()
 
 
 def save_wav_file(filename, wav_data, sample_rate):
-    """Saves audio sample data to a .wav audio file.
-
-    Args:
-      filename: Path to save the file to.
-      wav_data: 2D array of float PCM-encoded audio data.
-      sample_rate: Samples per second to encode in the file.
-    """
-    wav_data_tensor = tf.constant(np.reshape(wav_data, (-1, 1)), dtype=tf.float32)
-    wav_encoder = tf.audio.encode_wav(wav_data_tensor, sample_rate)
-    io_ops.write_file(filename, wav_encoder)
+    wav_tensor = tf.constant(np.reshape(wav_data, (-1, 1)), dtype=tf.float32)
+    encoded = tf.audio.encode_wav(wav_tensor, sample_rate)
+    io_ops.write_file(filename, encoded)
 
 
 def get_features_range(model_settings):
-    """Returns the expected min/max for generated features.
-
-    Args:
-      model_settings: Information about the current model being trained.
-
-    Returns:
-      Min/max float pair holding the range of features.
-
-    Raises:
-      Exception: If preprocessing mode isn't recognized.
-    """
-    if model_settings['preprocess'] == 'average':
+    mode = model_settings['preprocess']
+    if mode == 'average':
         return 0.0, 127.5
-    elif model_settings['preprocess'] == 'mfcc':
+    elif mode == 'mfcc':
         return -247.0, 30.0
-    elif model_settings['preprocess'] == 'micro':
+    elif mode == 'micro':
         return 0.0, 26.0
-    raise Exception(
-        'Unknown preprocess mode "%s" (should be "mfcc", "average", or "micro")'
-        % model_settings['preprocess']
-    )
+    raise Exception('Unknown preprocess mode "%s"' % mode)
 
 
 # ---------------------------------------------------------------------------
@@ -165,16 +134,10 @@ class AudioProcessor:
         self.prepare_processing_graph(model_settings, summaries_dir)
 
     # ------------------------------------------------------------------
-    # Download / extraction
+    # Download
     # ------------------------------------------------------------------
 
     def maybe_download_and_extract_dataset(self, data_url, dest_directory):
-        """Download and extract data set tar file.
-
-        Args:
-          data_url: Web location of the tar file containing the data set.
-          dest_directory: File path to extract data to.
-        """
         if not data_url:
             return
         if not gfile.Exists(dest_directory):
@@ -188,21 +151,17 @@ class AudioProcessor:
                         filename,
                         float(count * block_size) / float(total_size) * 100.0))
                 sys.stdout.flush()
-
             try:
                 filepath, _ = urllib.request.urlretrieve(
                     data_url, filepath, _progress)
             except Exception:
                 tf.get_logger().error(
-                    'Failed to download URL: %s to folder: %s. Please make sure '
-                    'you have enough free space and an internet connection.',
-                    data_url, filepath)
+                    'Failed to download %s to %s', data_url, filepath)
                 raise
             print()
             statinfo = os.stat(filepath)
             tf.get_logger().info(
-                'Successfully downloaded %s (%d bytes).',
-                filename, statinfo.st_size)
+                'Downloaded %s (%d bytes)', filename, statinfo.st_size)
             tarfile.open(filepath, 'r:gz').extractall(dest_directory)
 
     # ------------------------------------------------------------------
@@ -212,75 +171,50 @@ class AudioProcessor:
     def prepare_data_index(self, silence_percentage, unknown_percentage,
                             wanted_words, validation_percentage,
                             testing_percentage):
-        """Prepares a list of the samples organized by set and label.
-
-        Args:
-          silence_percentage: How much of the resulting data should be silence.
-          unknown_percentage: How much should be audio outside wanted classes.
-          wanted_words: Labels of the classes we want to recognize.
-          validation_percentage: How much of the data set to use for validation.
-          testing_percentage: How much of the data set to use for testing.
-
-        Raises:
-          Exception: If expected files are not found.
-        """
         random.seed(RANDOM_SEED)
-        wanted_words_index = {
-            word: idx + 2 for idx, word in enumerate(wanted_words)
-        }
+        wanted_words_index = {w: i + 2 for i, w in enumerate(wanted_words)}
         self.data_index = {'validation': [], 'testing': [], 'training': []}
-        unknown_index = {'validation': [], 'testing': [], 'training': []}
+        unknown_index   = {'validation': [], 'testing': [], 'training': []}
         all_words = {}
 
-        search_path = os.path.join(self.data_dir, '*', '*.wav')
-        for wav_path in gfile.Glob(search_path):
+        for wav_path in gfile.Glob(os.path.join(self.data_dir, '*', '*.wav')):
             _, word = os.path.split(os.path.dirname(wav_path))
             word = word.lower()
             if word == BACKGROUND_NOISE_DIR_NAME:
                 continue
             all_words[word] = True
-            set_index = which_set(
-                wav_path, validation_percentage, testing_percentage)
+            split = which_set(wav_path, validation_percentage,
+                               testing_percentage)
             if word in wanted_words_index:
-                self.data_index[set_index].append(
-                    {'label': word, 'file': wav_path})
+                self.data_index[split].append({'label': word, 'file': wav_path})
             else:
-                unknown_index[set_index].append(
-                    {'label': word, 'file': wav_path})
+                unknown_index[split].append({'label': word, 'file': wav_path})
 
         if not all_words:
-            raise Exception('No .wavs found at ' + search_path)
-        for wanted_word in wanted_words:
-            if wanted_word not in all_words:
-                raise Exception(
-                    'Expected to find ' + wanted_word +
-                    ' in labels but only found ' +
-                    ', '.join(all_words.keys()))
+            raise Exception('No .wavs found at ' +
+                            os.path.join(self.data_dir, '*', '*.wav'))
+        for w in wanted_words:
+            if w not in all_words:
+                raise Exception('Expected to find "%s" but only found: %s'
+                                % (w, ', '.join(all_words)))
 
         silence_wav_path = self.data_index['training'][0]['file']
-        for set_index in ['validation', 'testing', 'training']:
-            set_size = len(self.data_index[set_index])
-            silence_size = int(
-                math.ceil(set_size * silence_percentage / 100))
-            for _ in range(silence_size):
-                self.data_index[set_index].append(
+        for split in ('validation', 'testing', 'training'):
+            n = len(self.data_index[split])
+            for _ in range(int(math.ceil(n * silence_percentage / 100))):
+                self.data_index[split].append(
                     {'label': SILENCE_LABEL, 'file': silence_wav_path})
-            random.shuffle(unknown_index[set_index])
-            unknown_size = int(
-                math.ceil(set_size * unknown_percentage / 100))
-            self.data_index[set_index].extend(
-                unknown_index[set_index][:unknown_size])
-
-        for set_index in ['validation', 'testing', 'training']:
-            random.shuffle(self.data_index[set_index])
+            random.shuffle(unknown_index[split])
+            unk_n = int(math.ceil(n * unknown_percentage / 100))
+            self.data_index[split].extend(unknown_index[split][:unk_n])
+            random.shuffle(self.data_index[split])
 
         self.words_list = prepare_words_list(wanted_words)
-        self.word_to_index = {}
-        for word in all_words:
-            if word in wanted_words_index:
-                self.word_to_index[word] = wanted_words_index[word]
-            else:
-                self.word_to_index[word] = UNKNOWN_WORD_INDEX
+        self.word_to_index = {
+            w: (wanted_words_index[w] if w in wanted_words_index
+                else UNKNOWN_WORD_INDEX)
+            for w in all_words
+        }
         self.word_to_index[SILENCE_LABEL] = SILENCE_INDEX
 
     # ------------------------------------------------------------------
@@ -288,77 +222,73 @@ class AudioProcessor:
     # ------------------------------------------------------------------
 
     def prepare_background_data(self):
-        """Searches a folder for background noise audio and loads it into memory.
+        """Load background noise clips and cache as a stacked numpy array.
 
-        Raises:
-          Exception: If the background folder exists but is empty.
+        `_background_tensor` is built lazily on the first `get_data()` call
+        once `desired_samples` is known.
         """
         self.background_data = []
-        background_dir = os.path.join(self.data_dir, BACKGROUND_NOISE_DIR_NAME)
-        if not gfile.Exists(background_dir):
+        self._background_tensor = None   # built lazily in _ensure_background_tensor
+
+        bg_dir = os.path.join(self.data_dir, BACKGROUND_NOISE_DIR_NAME)
+        if not gfile.Exists(bg_dir):
             return
 
-        search_path = os.path.join(
-            self.data_dir, BACKGROUND_NOISE_DIR_NAME, '*.wav')
-        for wav_path in gfile.Glob(search_path):
-            wav_loader = io_ops.read_file(wav_path)
-            wav_decoder = tf.audio.decode_wav(wav_loader, desired_channels=1)
-            self.background_data.append(
-                wav_decoder.audio.numpy().flatten())
+        search = os.path.join(bg_dir, '*.wav')
+        for wav_path in gfile.Glob(search):
+            raw = io_ops.read_file(wav_path)
+            decoded = tf.audio.decode_wav(raw, desired_channels=1)
+            self.background_data.append(decoded.audio.numpy().flatten())
 
         if not self.background_data:
-            raise Exception(
-                'No background wav files were found in ' + search_path)
+            raise Exception('No background wavs in ' + search)
+
+    def _ensure_background_tensor(self, desired_samples):
+        """Build (once) the [N, desired_samples] background constant tensor."""
+        if self._background_tensor is not None:
+            return
+        if not self.background_data:
+            self._background_tensor = tf.zeros(
+                [1, desired_samples], dtype=tf.float32)
+            return
+        clips = []
+        for bg in self.background_data:
+            if len(bg) < desired_samples:
+                raise ValueError(
+                    'Background clip too short (%d < %d samples)'
+                    % (len(bg), desired_samples))
+            clips.append(bg[:desired_samples].astype(np.float32))
+        # Shape: [N_clips, desired_samples] — lives in C++ memory, zero-copy
+        # inside tf.function gather calls.
+        self._background_tensor = tf.constant(
+            np.stack(clips), dtype=tf.float32)
 
     # ------------------------------------------------------------------
-    # Processing graph (now a @tf.function for efficient repeated use)
+    # Processing graph
     # ------------------------------------------------------------------
 
     def prepare_processing_graph(self, model_settings, summaries_dir):
-        """Stores model settings and sets up the TensorBoard summary writer.
-
-        In TF2 the per-sample processing is done eagerly in get_data() using
-        _process_sample(), which is compiled via @tf.function for speed.
-
-        Args:
-          model_settings: Information about the current model being trained.
-          summaries_dir: Path to save training summary information to.
-        """
+        """Compile the per-sample feature-extraction tf.function once."""
         self._model_settings = model_settings
 
-        # Summary writer for data-pipeline images (optional).
         self.summary_writer_ = None
         if summaries_dir:
             self.summary_writer_ = tf.summary.create_file_writer(
                 os.path.join(summaries_dir, 'data'))
 
-        # Build a tf.function that processes a single sample tensor so the
-        # graph is compiled once and reused across calls.
-        preprocess = model_settings['preprocess']
+        preprocess      = model_settings['preprocess']
         desired_samples = model_settings['desired_samples']
-        window_size = model_settings['window_size_samples']
-        window_stride = model_settings['window_stride_samples']
-        fingerprint_width = model_settings['fingerprint_width']
-        average_window_width = model_settings.get('average_window_width', -1)
-        sample_rate = model_settings['sample_rate']
+        window_size     = model_settings['window_size_samples']
+        window_stride   = model_settings['window_stride_samples']
+        fp_width        = model_settings['fingerprint_width']
+        avg_win         = model_settings.get('average_window_width', -1)
+        sample_rate     = model_settings['sample_rate']
 
         @tf.function
         def _process_audio(foreground, background_data,
                             background_volume, foreground_volume,
                             time_shift_padding, time_shift_offset):
-            """Applies augmentation + feature extraction to one audio clip.
-
-            Args:
-              foreground:          [desired_samples, 1] float32 audio.
-              background_data:     [desired_samples, 1] float32 noise.
-              background_volume:   Scalar float — noise gain.
-              foreground_volume:   Scalar float — speech gain (0 = silence).
-              time_shift_padding:  [2, 2] int32 pad amounts.
-              time_shift_offset:   [2]    int32 slice start.
-
-            Returns:
-              features: Flattened 1-D float32 feature vector.
-            """
+            """Augment one clip and return a flat feature vector."""
             scaled = tf.multiply(foreground, foreground_volume)
             padded = tf.pad(scaled, time_shift_padding, mode='CONSTANT')
             sliced = tf.slice(padded, time_shift_offset, [desired_samples, -1])
@@ -366,245 +296,216 @@ class AudioProcessor:
             mixed = tf.clip_by_value(tf.add(bg_mul, sliced), -1.0, 1.0)
 
             spectrogram = audio_ops.audio_spectrogram(
-                mixed,
-                window_size=window_size,
-                stride=window_stride,
-                magnitude_squared=True)
+                mixed, window_size=window_size,
+                stride=window_stride, magnitude_squared=True)
 
             if preprocess == 'average':
                 output = tf.nn.pool(
                     input=tf.expand_dims(spectrogram, -1),
-                    window_shape=[1, average_window_width],
-                    strides=[1, average_window_width],
-                    pooling_type='AVG',
-                    padding='SAME')
+                    window_shape=[1, avg_win],
+                    strides=[1, avg_win],
+                    pooling_type='AVG', padding='SAME')
             elif preprocess == 'mfcc':
-                # sample_rate must be a Python int for audio_ops.mfcc
                 output = audio_ops.mfcc(
-                    spectrogram,
-                    sample_rate,
-                    dct_coefficient_count=fingerprint_width)
+                    spectrogram, sample_rate,
+                    dct_coefficient_count=fp_width)
             elif preprocess == 'micro':
                 if not frontend_op:
                     raise Exception(
-                        'Micro frontend op is not available when running '
-                        'TensorFlow directly from Python.')
-                window_size_ms = (window_size * 1000) / sample_rate
-                window_step_ms = (window_stride * 1000) / sample_rate
-                int16_input = tf.cast(
-                    tf.multiply(mixed, 32768), tf.int16)
-                micro_frontend = frontend_op.audio_microfrontend(
-                    int16_input,
-                    sample_rate=sample_rate,
-                    window_size=window_size_ms,
-                    window_step=window_step_ms,
-                    num_channels=fingerprint_width,
-                    out_scale=1,
+                        'Micro frontend op unavailable outside Bazel.')
+                ws_ms = (window_size   * 1000) / sample_rate
+                wt_ms = (window_stride * 1000) / sample_rate
+                i16   = tf.cast(tf.multiply(mixed, 32768), tf.int16)
+                mf    = frontend_op.audio_microfrontend(
+                    i16, sample_rate=sample_rate,
+                    window_size=ws_ms, window_step=wt_ms,
+                    num_channels=fp_width, out_scale=1,
                     out_type=tf.float32)
-                output = tf.multiply(micro_frontend, (10.0 / 256.0))
+                output = tf.multiply(mf, 10.0 / 256.0)
             else:
-                raise ValueError(
-                    'Unknown preprocess mode "%s"' % preprocess)
+                raise ValueError('Unknown preprocess mode "%s"' % preprocess)
 
             return tf.reshape(output, [-1])
 
         self._process_audio = _process_audio
 
     # ------------------------------------------------------------------
-    # Public interface (all sess arguments kept for API compatibility)
+    # Public API
     # ------------------------------------------------------------------
 
     def set_size(self, mode):
-        """Calculates the number of samples in the dataset partition.
-
-        Args:
-          mode: Which partition, must be 'training', 'validation', or 'testing'.
-
-        Returns:
-          Number of samples in the partition.
-        """
         return len(self.data_index[mode])
+
+    # ------------------------------------------------------------------
 
     def get_data(self, how_many, offset, model_settings, background_frequency,
                  background_volume_range, time_shift, mode, sess=None):
-        """Gather samples from the data set, applying transformations as needed.
+        """Return (fingerprints, labels) via a parallel tf.data pipeline.
 
-        Args:
-          how_many: Desired number of samples to return. -1 means all.
-          offset: Where to start when fetching deterministically.
-          model_settings: Information about the current model being trained.
-          background_frequency: How many clips will have background noise (0–1).
-          background_volume_range: How loud the background noise will be.
-          time_shift: How much to randomly shift the clips by in time.
-          mode: Which partition, must be 'training', 'validation', or 'testing'.
-          sess: Unused — kept for API compatibility with TF1 call-sites.
+        Signature is identical to the original TF1 version.  `sess` is
+        accepted but ignored.
+
+        The internal implementation replaces the single-threaded Python loop
+        with a `tf.data.Dataset` that maps `_process_one` (file I/O +
+        augment + features) across `tf.data.AUTOTUNE` parallel threads and
+        prefetches the assembled batch.
 
         Returns:
-          Tuple (data, labels):
-            data:   np.ndarray [sample_count, fingerprint_size] float32.
-            labels: np.ndarray [sample_count] int.
-
-        Raises:
-          ValueError: If background samples are too short.
+          data   – np.ndarray [sample_count, fingerprint_size] float32
+          labels – np.ndarray [sample_count] int32
         """
-        candidates = self.data_index[mode]
+        candidates      = self.data_index[mode]
+        desired_samples = model_settings['desired_samples']
+        fp_size         = model_settings['fingerprint_size']
+
+        # Lazily build stacked background tensor now that desired_samples is known.
+        self._ensure_background_tensor(desired_samples)
+
+        # --- Determine which samples to process ---
         if how_many == -1:
             sample_count = len(candidates)
+            indices = list(range(len(candidates)))
         else:
             sample_count = max(0, min(how_many, len(candidates) - offset))
-
-        data = np.zeros((sample_count, model_settings['fingerprint_size']),
-                        dtype=np.float32)
-        labels = np.zeros(sample_count, dtype=np.int32)
-
-        desired_samples = model_settings['desired_samples']
-        use_background = self.background_data and (mode == 'training')
-        pick_deterministically = (mode != 'training')
-
-        for i in range(offset, offset + sample_count):
-            if how_many == -1 or pick_deterministically:
-                sample_index = i
+            if mode == 'training':
+                # Random draw — same semantics as original.
+                indices = np.random.randint(
+                    0, len(candidates), size=sample_count).tolist()
             else:
-                sample_index = np.random.randint(len(candidates))
-            sample = candidates[sample_index]
+                indices = list(range(offset, offset + sample_count))
 
-            # ---- Load foreground wav ----
-            wav_loader = io_ops.read_file(sample['file'])
-            wav_decoder = tf.audio.decode_wav(
-                wav_loader, desired_channels=1,
-                desired_samples=desired_samples)
-            foreground = wav_decoder.audio  # [desired_samples, 1]
+        if sample_count == 0:
+            return (np.zeros((0, fp_size), dtype=np.float32),
+                    np.zeros(0, dtype=np.int32))
 
-            # ---- Time shift ----
-            if time_shift > 0:
-                time_shift_amount = np.random.randint(-time_shift, time_shift)
+        files         = [candidates[i]['file']  for i in indices]
+        word_indices  = [self.word_to_index[candidates[i]['label']]
+                         for i in indices]
+        silence_flags = [1 if candidates[i]['label'] == SILENCE_LABEL else 0
+                         for i in indices]
+
+        use_background = bool(self.background_data) and (mode == 'training')
+        bg_tensor      = self._background_tensor          # [N_bg, desired_samples]
+        n_bg           = int(bg_tensor.shape[0])
+
+        # Scalar Python values captured once per call — not per sample.
+        bg_frequency    = float(background_frequency)
+        bg_vol_range    = float(background_volume_range)
+        time_shift_samp = int(time_shift)
+        process_audio   = self._process_audio             # compiled tf.function
+
+        @tf.function
+        def _process_one(wav_path, label, silence_flag):
+            # Load
+            audio, _ = tf.audio.decode_wav(
+                tf.io.read_file(wav_path),
+                desired_channels=1, desired_samples=desired_samples)
+
+            # Time shift
+            if time_shift_samp > 0:
+                shift = tf.random.uniform(
+                    [], -time_shift_samp, time_shift_samp, dtype=tf.int32)
             else:
-                time_shift_amount = 0
-            if time_shift_amount > 0:
-                time_shift_padding = [[time_shift_amount, 0], [0, 0]]
-                time_shift_offset = [0, 0]
+                shift = tf.constant(0, tf.int32)
+            pad_l   = tf.maximum(shift, 0)
+            pad_r   = tf.maximum(-shift, 0)
+            padding = tf.stack([[pad_l, pad_r], [0, 0]])
+            t_off   = tf.stack([pad_r, 0])
+
+            # Background
+            if use_background:
+                bg_idx  = tf.random.uniform([], 0, n_bg, dtype=tf.int32)
+                bg_clip = tf.reshape(bg_tensor[bg_idx], [desired_samples, 1])
+                bg_vol  = tf.cond(
+                    tf.equal(silence_flag, 1),
+                    true_fn=lambda: tf.random.uniform([], 0.0, 1.0),
+                    false_fn=lambda: tf.cond(
+                        tf.less(tf.random.uniform([]), bg_frequency),
+                        true_fn=lambda: tf.random.uniform([], 0.0, bg_vol_range),
+                        false_fn=lambda: tf.constant(0.0)))
             else:
-                time_shift_padding = [[0, -time_shift_amount], [0, 0]]
-                time_shift_offset = [-time_shift_amount, 0]
+                bg_clip = tf.zeros([desired_samples, 1], tf.float32)
+                bg_vol  = tf.constant(0.0)
 
-            # ---- Background noise ----
-            if use_background or sample['label'] == SILENCE_LABEL:
-                background_index = np.random.randint(len(self.background_data))
-                background_samples = self.background_data[background_index]
-                if len(background_samples) <= desired_samples:
-                    raise ValueError(
-                        'Background sample is too short! Need more than %d '
-                        'samples but only %d were found' %
-                        (desired_samples, len(background_samples)))
-                background_offset = np.random.randint(
-                    0, len(background_samples) - desired_samples)
-                background_clipped = background_samples[
-                    background_offset: background_offset + desired_samples]
-                background_reshaped = background_clipped.reshape(
-                    [desired_samples, 1])
-                if sample['label'] == SILENCE_LABEL:
-                    background_volume = np.random.uniform(0, 1)
-                elif np.random.uniform(0, 1) < background_frequency:
-                    background_volume = np.random.uniform(
-                        0, background_volume_range)
-                else:
-                    background_volume = 0.0
-            else:
-                background_reshaped = np.zeros(
-                    [desired_samples, 1], dtype=np.float32)
-                background_volume = 0.0
+            fg_vol = tf.cond(
+                tf.equal(silence_flag, 1),
+                lambda: tf.constant(0.0),
+                lambda: tf.constant(1.0))
 
-            foreground_volume = (
-                0.0 if sample['label'] == SILENCE_LABEL else 1.0)
+            features = process_audio(audio, bg_clip, bg_vol, fg_vol,
+                                     padding, t_off)
+            return features, tf.cast(label, tf.int32)
 
-            # ---- Feature extraction ----
-            features = self._process_audio(
-                foreground,
-                tf.constant(background_reshaped, dtype=tf.float32),
-                tf.constant(background_volume, dtype=tf.float32),
-                tf.constant(foreground_volume, dtype=tf.float32),
-                tf.constant(time_shift_padding, dtype=tf.int32),
-                tf.constant(time_shift_offset, dtype=tf.int32),
-            )
+        # Build and run the pipeline — all parallel work happens in C++.
+        ds = tf.data.Dataset.from_tensor_slices((
+            tf.constant(files),
+            tf.constant(word_indices,  dtype=tf.int32),
+            tf.constant(silence_flags, dtype=tf.int32),
+        ))
+        ds = ds.map(_process_one,
+                    num_parallel_calls=tf.data.AUTOTUNE,
+                    deterministic=(mode != 'training'))
+        ds = ds.batch(sample_count).prefetch(1)
 
-            data[i - offset, :] = features.numpy()
-            labels[i - offset] = self.word_to_index[sample['label']]
+        for fp_batch, lbl_batch in ds:
+            return fp_batch.numpy(), lbl_batch.numpy()
 
-            # Optional TensorBoard image summary (best-effort).
-            if self.summary_writer_:
-                with self.summary_writer_.as_default():
-                    tf.summary.image(
-                        'features',
-                        tf.reshape(features, [1, 1, -1, 1]),
-                        step=i)
-
-        return data, labels
+    # ------------------------------------------------------------------
 
     def get_features_for_wav(self, wav_filename, model_settings, sess=None):
-        """Applies the feature transformation process to the input wav.
-
-        Args:
-          wav_filename: The path to the input audio file.
-          model_settings: Information about the current model being trained.
-          sess: Unused — kept for API compatibility with TF1 call-sites.
-
-        Returns:
-          Numpy array containing the generated features.
-        """
+        """Extract features from a single WAV file.  `sess` is ignored."""
         desired_samples = model_settings['desired_samples']
-        wav_loader = io_ops.read_file(wav_filename)
-        wav_decoder = tf.audio.decode_wav(
-            wav_loader, desired_channels=1, desired_samples=desired_samples)
-
+        raw     = io_ops.read_file(wav_filename)
+        decoded = tf.audio.decode_wav(
+            raw, desired_channels=1, desired_samples=desired_samples)
         features = self._process_audio(
-            wav_decoder.audio,
-            tf.zeros([desired_samples, 1], dtype=tf.float32),
-            tf.constant(0.0, dtype=tf.float32),
-            tf.constant(1.0, dtype=tf.float32),
-            tf.constant([[0, 0], [0, 0]], dtype=tf.int32),
-            tf.constant([0, 0], dtype=tf.int32),
+            decoded.audio,
+            tf.zeros([desired_samples, 1], tf.float32),
+            tf.constant(0.0, tf.float32),
+            tf.constant(1.0, tf.float32),
+            tf.constant([[0, 0], [0, 0]], tf.int32),
+            tf.constant([0, 0], tf.int32),
         )
         return features.numpy()
 
+    # ------------------------------------------------------------------
+
     def get_unprocessed_data(self, how_many, model_settings, mode):
-        """Retrieve raw sample data with no transformations.
-
-        Args:
-          how_many: Desired number of samples to return. -1 means all.
-          model_settings: Information about the current model being trained.
-          mode: Which partition, must be 'training', 'validation', or 'testing'.
-
-        Returns:
-          Tuple (data, labels):
-            data:   np.ndarray [sample_count, desired_samples] float32.
-            labels: List of word-string labels.
-        """
-        candidates = self.data_index[mode]
-        sample_count = len(candidates) if how_many == -1 else how_many
+        """Return raw (unaugmented) audio arrays.  No `sess` needed."""
+        candidates      = self.data_index[mode]
         desired_samples = model_settings['desired_samples']
+        sample_count    = len(candidates) if how_many == -1 else how_many
 
-        data = np.zeros((sample_count, desired_samples), dtype=np.float32)
-        labels = []
+        if mode == 'training' and how_many != -1:
+            indices = np.random.randint(
+                0, len(candidates), size=sample_count).tolist()
+        else:
+            indices = list(range(sample_count))
 
-        for i in range(sample_count):
-            if how_many == -1:
-                sample_index = i
-            else:
-                sample_index = np.random.randint(len(candidates))
-            sample = candidates[sample_index]
+        files         = [candidates[i]['file'] for i in indices]
+        silence_flags = [1 if candidates[i]['label'] == SILENCE_LABEL else 0
+                         for i in indices]
+        label_indices = [self.word_to_index[candidates[i]['label']]
+                         for i in indices]
 
-            wav_loader = io_ops.read_file(sample['file'])
-            wav_decoder = tf.audio.decode_wav(
-                wav_loader, desired_channels=1,
-                desired_samples=desired_samples)
+        @tf.function
+        def _load_one(wav_path, silence_flag):
+            audio, _ = tf.audio.decode_wav(
+                tf.io.read_file(wav_path),
+                desired_channels=1, desired_samples=desired_samples)
+            vol = tf.cond(tf.equal(silence_flag, 1),
+                          lambda: tf.constant(0.0),
+                          lambda: tf.constant(1.0))
+            return tf.reshape(audio * vol, [desired_samples])
 
-            foreground_volume = (
-                0.0 if sample['label'] == SILENCE_LABEL else 1.0)
-            scaled = tf.multiply(wav_decoder.audio,
-                                 tf.constant(foreground_volume, tf.float32))
-            data[i, :] = scaled.numpy().flatten()
+        ds = tf.data.Dataset.from_tensor_slices((
+            tf.constant(files),
+            tf.constant(silence_flags, dtype=tf.int32),
+        ))
+        ds = ds.map(_load_one, num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.batch(sample_count).prefetch(1)
 
-            label_index = self.word_to_index[sample['label']]
-            labels.append(self.words_list[label_index])
-
-        return data, labels
+        for audio_batch in ds:
+            data   = audio_batch.numpy()
+            labels = [self.words_list[li] for li in label_indices]
+            return data, labels
