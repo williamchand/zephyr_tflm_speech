@@ -18,14 +18,28 @@ class SpeechCommandsInferenceModel(tf.Module):
         dummy_input = tf.zeros([1, self.fingerprint_size], dtype=tf.float32)
         self._model_output = create_model(dummy_input, model_settings, model_architecture, is_training=False)
 
-    @tf.function(input_signature=[tf.TensorSpec(shape=[None, None], dtype=tf.float32)])
-    def infer(self, fingerprint_input):
+        # Wrap the inference function with a tf.function now that we know
+        # fingerprint_size.  Decorating at the class level fails because
+        # `self` is not available during class definition time.
+        self.infer = tf.function(
+            self._infer,
+            input_signature=[
+                tf.TensorSpec(
+                    shape=[None, self.fingerprint_size],
+                    dtype=tf.float32,
+                )
+            ],
+        )
+
+    def _infer(self, fingerprint_input):
         # Flatten input and pad/truncate to match fingerprint_size
         flattened = tf.reshape(fingerprint_input, [-1])
         size_diff = self.fingerprint_size - tf.size(flattened)
-        padded = tf.cond(size_diff > 0,
-                         lambda: tf.pad(flattened, [[0, size_diff]]),
-                         lambda: flattened[:self.fingerprint_size])
+        padded = tf.cond(
+            size_diff > 0,
+            lambda: tf.pad(flattened, [[0, size_diff]]),
+            lambda: flattened[: self.fingerprint_size],
+        )
         reshaped = tf.reshape(padded, [1, self.fingerprint_size])
 
         # create_model always returns tensor (or tuple), not a callable
