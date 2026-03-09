@@ -11,7 +11,6 @@ import input_data
 
 
 def main():
-
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--data_url", type=str, default="")
@@ -56,6 +55,13 @@ def main():
 
     parser.add_argument("--train_dir",
                         type=str, default="./train")
+
+    # --- Added to accept original TF flags without breaking ---
+    parser.add_argument("--preprocess", type=str, default="mfcc")
+    parser.add_argument("--summaries_dir", type=str, default="logs/")
+    parser.add_argument("--verbosity", type=str, default="WARN")
+    parser.add_argument("--eval_step_interval", type=int, default=1000)
+    parser.add_argument("--save_step_interval", type=int, default=1000)
 
     FLAGS = parser.parse_args()
 
