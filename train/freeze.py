@@ -1,15 +1,12 @@
 # freeze.py
-# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 (the "License");
 import os
 import argparse
 import tensorflow as tf
-import numpy as np
 from models import create_model, prepare_model_settings, load_variables_from_checkpoint
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Inference Module
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 class SpeechCommandsInferenceModel(tf.Module):
     def __init__(self, model_settings, model_architecture='conv'):
         super().__init__()
@@ -17,36 +14,33 @@ class SpeechCommandsInferenceModel(tf.Module):
         self.fingerprint_size = model_settings['fingerprint_size']
         self.model_architecture = model_architecture
 
-        # Dummy input to build model
+        # Build actual Keras model
         dummy_input = tf.zeros([1, self.fingerprint_size], dtype=tf.float32)
-        self._model = create_model(
-            dummy_input,
-            self.model_settings,
-            self.model_architecture,
-            is_training=False
-        )
+        result = create_model(dummy_input, model_settings, model_architecture, is_training=False)
+        
+        # create_model may return tuple (logits, dropout)
+        if isinstance(result, tuple):
+            self._keras_model = result[0]._keras_model if hasattr(result[0], "_keras_model") else result[0]
+        else:
+            self._keras_model = result
 
     @tf.function(input_signature=[tf.TensorSpec(shape=[None, None], dtype=tf.float32)])
     def infer(self, fingerprint_input):
-        # Flatten features
+        # Flatten input and pad/truncate to match fingerprint_size
         flattened = tf.reshape(fingerprint_input, [-1])
-
-        # Pad or truncate to match model's fingerprint_size
-        desired_size = self.fingerprint_size
-        flattened = tf.cond(
-            tf.size(flattened) < desired_size,
-            lambda: tf.pad(flattened, [[0, desired_size - tf.size(flattened)]]),
-            lambda: flattened[:desired_size]
-        )
-
-        # Reshape to [1, fingerprint_size]
-        reshaped = tf.reshape(flattened, [1, desired_size])
-        logits = self._model(reshaped, training=False)
+        size_diff = self.fingerprint_size - tf.size(flattened)
+        padded = tf.cond(size_diff > 0,
+                         lambda: tf.pad(flattened, [[0, size_diff]]),
+                         lambda: flattened[:self.fingerprint_size])
+        reshaped = tf.reshape(padded, [1, self.fingerprint_size])
+        
+        # Run Keras model
+        logits = self._keras_model(reshaped, training=False)
         return logits
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Utilities
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def save_saved_model(export_dir, inference_model):
     tf.saved_model.save(
         inference_model,
@@ -55,9 +49,9 @@ def save_saved_model(export_dir, inference_model):
     )
     print(f"SavedModel exported to {export_dir} successfully!")
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Main
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--wanted_words', type=str, default='yes,no,up,down')
@@ -69,7 +63,7 @@ def main():
     parser.add_argument('--output_file', type=str, required=True)
     args = parser.parse_args()
 
-    # Example settings
+    # Model settings
     model_settings = prepare_model_settings(
         label_count=len(args.wanted_words.split(',')),
         sample_rate=16000,
@@ -94,6 +88,5 @@ def main():
     if args.save_format == 'saved_model':
         save_saved_model(args.output_file, inference_module)
 
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
