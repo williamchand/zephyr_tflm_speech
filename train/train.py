@@ -182,114 +182,133 @@ def build_dataset(audio_processor, model_settings, mode,
     n_bg   = int(bg_tensor.shape[0])
 
     # ------------------------------------------------------------------
-    # process_one  — CPU-pinned feature extraction for one sample.
-    #
-    # Why /CPU:0: audio_spectrogram and mfcc have no GPU kernels. Pinning
-    # explicitly prevents unnecessary host↔device transfers of intermediate
-    # tensors.
-    #
-    # Why no input_signature: audio_ops.mfcc returns a tensor with a
-    # dynamic time-dimension. input_signature forces symbolic tracing which
-    # assigns that dimension 0, making tf.reshape(..., [fp_size]) raise.
-    # Plain @tf.function traces lazily on the first real call with concrete
-    # shapes — no reshape crash.
+    # Why tf.numpy_function — the definitive fix for the reshape crash
     # ------------------------------------------------------------------
-    @tf.function
+    # ds.map() ALWAYS traces the mapped function eagerly to determine its
+    # output spec (shapes + dtypes).  audio_ops.mfcc returns a tensor with
+    # a dynamic time-dimension; TF assigns that dimension 0 during tracing.
+    # Any tf.reshape([...,0,40] -> [fp_size]) therefore raises at trace time,
+    # regardless of whether the reshape is in the same function or a separate
+    # chained .map() call — TF still traces both.
+    #
+    # tf.numpy_function wraps the entire extraction as an OPAQUE Python
+    # callable.  TF never traces inside it; it simply trusts the declared
+    # Tout dtypes and the explicit .set_shape() call we make afterwards.
+    # The audio ops still run as TF graph ops (called eagerly from the
+    # Python thread), so /CPU:0 placement and parallelism are preserved.
+    # ------------------------------------------------------------------
+
+    # Pre-import micro frontend so the closure can reference it without a
+    # try/except inside the hot path.
+    _frontend_op = None
+    if preprocess == 'micro':
+        try:
+            from tensorflow.lite.experimental.microfrontend.python.ops                 import audio_microfrontend_op as _frontend_op
+        except ImportError:
+            raise ImportError(
+                'Micro frontend op unavailable. Build with Bazel or '
+                'install the microfrontend package.')
+
+    bg_np = bg_tensor.numpy()   # [N_bg, desired_samples] numpy array
+
+    def _extract_features(wav_path_bytes, silence_flag_val):
+        """Pure-Python feature extractor called by tf.numpy_function.
+
+        Runs eagerly in a tf.data worker thread.  All TF ops inside are
+        called eagerly (no tracing), so mfcc returns its real shape.
+
+        Args:
+          wav_path_bytes:  bytes — file path encoded as UTF-8.
+          silence_flag_val: np.int32 scalar — 1 if this is a silence sample.
+
+        Returns:
+          np.ndarray [fp_size] float32 — flat feature vector.
+        """
+        wav_path     = wav_path_bytes.decode('utf-8')
+        silence_flag = int(silence_flag_val)
+
+        # ---- Load ----
+        raw        = tf.io.read_file(wav_path)
+        audio, sr  = tf.audio.decode_wav(
+            raw, desired_channels=1, desired_samples=desired_samples)
+
+        # ---- Time shift ----
+        if time_shift_samples > 0:
+            shift = int(np.random.randint(-time_shift_samples,
+                                          time_shift_samples))
+        else:
+            shift = 0
+        pad_l = max(shift, 0)
+        pad_r = max(-shift, 0)
+        sliced = audio.numpy()[pad_r: pad_r + desired_samples]
+        # Pad with zeros if the slice is short (edge case near clip boundary)
+        if len(sliced) < desired_samples:
+            sliced = np.pad(sliced, ((0, desired_samples - len(sliced)), (0, 0)))
+        sliced = tf.constant(sliced, dtype=tf.float32)
+
+        # ---- Silence: mute foreground ----
+        fg_vol = 0.0 if silence_flag == 1 else 1.0
+        sliced = sliced * fg_vol
+
+        # ---- Background noise ----
+        if use_bg:
+            bg_idx  = np.random.randint(0, n_bg)
+            bg_clip = bg_np[bg_idx].reshape(desired_samples, 1).astype(np.float32)
+            bg_clip = tf.constant(bg_clip)
+            if silence_flag == 1:
+                bg_vol = float(np.random.uniform(0.0, 1.0))
+            elif np.random.uniform() < background_frequency:
+                bg_vol = float(np.random.uniform(0.0, background_volume_range))
+            else:
+                bg_vol = 0.0
+            mixed = tf.clip_by_value(sliced + bg_clip * bg_vol, -1.0, 1.0)
+        else:
+            mixed = sliced
+
+        # ---- Spectrogram ----
+        spectrogram = audio_ops.audio_spectrogram(
+            mixed, window_size=window_size, stride=window_stride,
+            magnitude_squared=True)
+
+        # ---- Features ----
+        if preprocess == 'average':
+            features = tf.nn.pool(
+                input=tf.expand_dims(spectrogram, -1),
+                window_shape=[1, avg_win], strides=[1, avg_win],
+                pooling_type='AVG', padding='SAME')
+        elif preprocess == 'mfcc':
+            features = audio_ops.mfcc(
+                spectrogram, sr, dct_coefficient_count=fp_width)
+        elif preprocess == 'micro':
+            ws_ms = (window_size   * 1000) / sample_rate
+            wt_ms = (window_stride * 1000) / sample_rate
+            i16   = tf.cast(tf.multiply(mixed, 32768), tf.int16)
+            mf    = _frontend_op.audio_microfrontend(
+                i16, sample_rate=sample_rate,
+                window_size=ws_ms, window_step=wt_ms,
+                num_channels=fp_width, out_scale=1, out_type=tf.float32)
+            features = tf.multiply(mf, 10.0 / 256.0)
+        else:
+            raise ValueError('Unknown preprocess mode: ' + preprocess)
+
+        # Flatten in plain NumPy — no tracing context, no symbolic shapes.
+        return features.numpy().flatten().astype(np.float32)
+
     def process_one(wav_path, label, silence_flag):
-        with tf.device('/CPU:0'):
-            # Load
-            audio, sr = tf.audio.decode_wav(
-                tf.io.read_file(wav_path),
-                desired_channels=1,
-                desired_samples=desired_samples)
+        """tf.data map function — wraps _extract_features as opaque callable.
 
-            # Time shift
-            shift = (tf.random.uniform(
-                         [], -time_shift_samples, time_shift_samples,
-                         dtype=tf.int32)
-                     if time_shift_samples > 0
-                     else tf.constant(0, tf.int32))
-            pad_l  = tf.maximum(shift, 0)
-            pad_r  = tf.maximum(-shift, 0)
-            sliced = tf.slice(
-                tf.pad(audio, [[pad_l, pad_r], [0, 0]]),
-                [pad_r, 0], [desired_samples, -1])
-
-            # Silence: zero foreground
-            sliced = sliced * tf.cond(
-                tf.equal(silence_flag, 1),
-                lambda: tf.constant(0.0),
-                lambda: tf.constant(1.0))
-
-            # Background noise
-            if use_bg:
-                bg_idx  = tf.random.uniform([], 0, n_bg, dtype=tf.int32)
-                bg_clip = tf.reshape(bg_tensor[bg_idx], [desired_samples, 1])
-                bg_vol  = tf.cond(
-                    tf.equal(silence_flag, 1),
-                    lambda: tf.random.uniform([], 0.0, 1.0),
-                    lambda: tf.cond(
-                        tf.less(tf.random.uniform([]),
-                                tf.constant(background_frequency,
-                                            dtype=tf.float32)),
-                        lambda: tf.random.uniform(
-                            [], 0.0,
-                            tf.constant(background_volume_range,
-                                        dtype=tf.float32)),
-                        lambda: tf.constant(0.0)))
-                mixed = tf.clip_by_value(sliced + bg_clip * bg_vol, -1.0, 1.0)
-            else:
-                mixed = sliced
-
-            # Spectrogram
-            spectrogram = audio_ops.audio_spectrogram(
-                mixed,
-                window_size=window_size,
-                stride=window_stride,
-                magnitude_squared=True)
-
-            # Features
-            if preprocess == 'average':
-                features = tf.nn.pool(
-                    input=tf.expand_dims(spectrogram, -1),
-                    window_shape=[1, avg_win],
-                    strides=[1, avg_win],
-                    pooling_type='AVG',
-                    padding='SAME')
-            elif preprocess == 'mfcc':
-                features = audio_ops.mfcc(
-                    spectrogram, sr,
-                    dct_coefficient_count=fp_width)
-            elif preprocess == 'micro':
-                try:
-                    from tensorflow.lite.experimental.microfrontend.python.ops \
-                        import audio_microfrontend_op as frontend_op
-                except ImportError:
-                    raise ImportError(
-                        'Micro frontend op unavailable. Build with Bazel or '
-                        'install the microfrontend package.')
-                ws_ms   = (window_size   * 1000) / sample_rate
-                wt_ms   = (window_stride * 1000) / sample_rate
-                i16     = tf.cast(tf.multiply(mixed, 32768), tf.int16)
-                mf      = frontend_op.audio_microfrontend(
-                    i16, sample_rate=sample_rate,
-                    window_size=ws_ms, window_step=wt_ms,
-                    num_channels=fp_width, out_scale=1,
-                    out_type=tf.float32)
-                features = tf.multiply(mf, 10.0 / 256.0)
-            else:
-                raise ValueError(
-                    'Unknown preprocess mode "%s" (should be "mfcc", '
-                    '"average", or "micro")' % preprocess)
-
-            # DO NOT tf.reshape here.
-            # ds.map() forces a trace of this entire function body; audio_ops.mfcc
-            # returns a tensor whose time-dimension TF assigns 0 during tracing.
-            # tf.reshape([..., 0, 40] -> [1960]) therefore raises at trace time
-            # even though the runtime shapes are always correct.
-            # The flatten is done in a SEPARATE .map(flatten) step below, which
-            # is traced independently once process_one's output spec is known.
-            return features, tf.cast(label, tf.int32)
+        tf.numpy_function tells TF: "call this Python function, give me back
+        a float32 tensor; do NOT trace inside it."  We then set_shape() so
+        downstream ops (batch, prefetch, distribute) know the exact shape.
+        """
+        features = tf.numpy_function(
+            func=_extract_features,
+            inp=[wav_path, silence_flag],
+            Tout=tf.float32)
+        # set_shape gives TF the static shape it would normally learn from
+        # tracing — required for batch() and MirroredStrategy to work.
+        features.set_shape([fp_size])
+        return features, tf.cast(label, tf.int32)
 
     # Assemble dataset
     ds = tf.data.Dataset.from_tensor_slices((
@@ -301,24 +320,17 @@ def build_dataset(audio_processor, model_settings, mode,
     if shuffle:
         ds = ds.shuffle(buffer_size=len(files), reshuffle_each_iteration=True)
 
-    # AUTOTUNE: TF picks the thread count based on CPU core count and
-    # observed throughput. Typically saturates all CPU cores.
+    # AUTOTUNE: TF data workers call _extract_features in parallel threads.
+    # The audio ops inside run eagerly (not traced) but still execute as
+    # TF C++ ops on /CPU:0.
     ds = ds.map(process_one,
                 num_parallel_calls=tf.data.AUTOTUNE,
                 deterministic=not shuffle)
 
-    # Flatten in a SEPARATE map so tf.reshape sees a concrete shape.
-    # process_one's output spec is fully known by the time this is traced,
-    # so [fp_size] is a valid target shape — no symbolic-zero crash.
-    def flatten(raw_features, label):
-        return tf.reshape(raw_features, [fp_size]), label
-    ds = ds.map(flatten, num_parallel_calls=tf.data.AUTOTUNE,
-                deterministic=not shuffle)
-
     ds = ds.batch(batch_size, drop_remainder=False)
 
-    # prefetch: pipeline computes batch N+1 on CPU while GPU trains on
-    # batch N — GPU never stalls waiting for data.
+    # prefetch: overlaps CPU feature extraction with GPU training — GPU
+    # never idles waiting for data.
     ds = ds.prefetch(tf.data.AUTOTUNE)
 
     # DATA sharding: each GPU replica reads a non-overlapping shard.

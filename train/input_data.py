@@ -475,7 +475,9 @@ class AudioProcessor(object):
                         dtype=tf.float32),
             tf.constant(0.0,  dtype=tf.float32),
         )
-        return [output.numpy()]
+        # Flatten to [fp_size] in NumPy — outside TF tracing — and wrap in a
+        # list to match the TF1 return format: sess.run([self.output_], ...).
+        return [output.numpy().flatten().astype(np.float32)]
 
     def get_unprocessed_data(self, how_many, model_settings, mode):
         """Return raw unaugmented audio samples."""
