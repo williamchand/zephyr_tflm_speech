@@ -14,15 +14,9 @@ class SpeechCommandsInferenceModel(tf.Module):
         self.fingerprint_size = model_settings['fingerprint_size']
         self.model_architecture = model_architecture
 
-        # Build actual Keras model
+        # Build model output (tensor)
         dummy_input = tf.zeros([1, self.fingerprint_size], dtype=tf.float32)
-        result = create_model(dummy_input, model_settings, model_architecture, is_training=False)
-        
-        # create_model may return tuple (logits, dropout)
-        if isinstance(result, tuple):
-            self._keras_model = result[0]._keras_model if hasattr(result[0], "_keras_model") else result[0]
-        else:
-            self._keras_model = result
+        self._model_output = create_model(dummy_input, model_settings, model_architecture, is_training=False)
 
     @tf.function(input_signature=[tf.TensorSpec(shape=[None, None], dtype=tf.float32)])
     def infer(self, fingerprint_input):
@@ -33,10 +27,16 @@ class SpeechCommandsInferenceModel(tf.Module):
                          lambda: tf.pad(flattened, [[0, size_diff]]),
                          lambda: flattened[:self.fingerprint_size])
         reshaped = tf.reshape(padded, [1, self.fingerprint_size])
-        
-        # Run Keras model
-        logits = self._keras_model(reshaped, training=False)
-        return logits
+
+        # create_model always returns tensor (or tuple), not a callable
+        # if tuple, take first element
+        if isinstance(self._model_output, tuple):
+            logits_tensor = self._model_output[0]
+        else:
+            logits_tensor = self._model_output
+
+        # Use tf.identity to make it a proper tensor output for SavedModel
+        return tf.identity(logits_tensor)
 
 # ---------------------------------------------------------------------------
 # Utilities
