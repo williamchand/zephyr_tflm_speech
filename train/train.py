@@ -1,6 +1,5 @@
 import argparse
 import os
-import time
 import numpy as np
 import tensorflow as tf
 
@@ -26,9 +25,9 @@ def prepare_model_settings(label_count, sample_rate, clip_duration_ms,
         raise ValueError("Unknown preprocess mode")
 
     spectrogram_length = 1 + int((desired_samples - window_size_samples) / window_stride_samples)
+    fingerprint_size = fingerprint_width * spectrogram_length
 
     average_window_width = 10 if preprocess == "average" else None
-    fingerprint_size = fingerprint_width * spectrogram_length
 
     return {
         "desired_samples": desired_samples,
@@ -42,6 +41,32 @@ def prepare_model_settings(label_count, sample_rate, clip_duration_ms,
         "average_window_width": average_window_width,
         "sample_rate": sample_rate,
     }
+
+# -----------------------------
+# Build TF2 Keras model
+# -----------------------------
+def build_tf2_model(model_settings, model_architecture):
+    fingerprint_size = model_settings['fingerprint_size']
+    dummy_input = tf.keras.Input(shape=(fingerprint_size,), batch_size=None)
+
+    builders = {
+        'single_fc': models._build_single_fc,
+        'conv': models._build_conv,
+        'low_latency_conv': models._build_low_latency_conv,
+        'low_latency_svdf': models._build_low_latency_svdf,
+        'tiny_conv': models._build_tiny_conv,
+        'tiny_embedding_conv': models._build_tiny_embedding_conv,
+    }
+
+    if model_architecture not in builders:
+        raise ValueError("Unknown architecture")
+
+    output = builders[model_architecture](dummy_input, model_settings, is_training=False)
+    if isinstance(output, tuple):
+        output = output[0]  # ignore TF1-style dropout placeholder
+
+    return tf.keras.Model(inputs=dummy_input, outputs=output)
+
 
 # -----------------------------
 # Main training loop
@@ -69,20 +94,15 @@ def main():
     parser.add_argument("--background_volume", type=float, default=0.1)
     parser.add_argument("--time_shift_ms", type=float, default=100.0)
     parser.add_argument("--preprocess", type=str, default="mfcc")
-    parser.add_argument("--summaries_dir", type=str, default="logs/")
-    # --- Redundant TF1-style flags to accept original calls ---
-    parser.add_argument("--train_dir", type=str, default="train/")
-    parser.add_argument("--verbosity", type=str, default="WARN")
-    parser.add_argument("--eval_step_interval", type=int, default=1000)
-    parser.add_argument("--save_step_interval", type=int, default=1000)
     FLAGS = parser.parse_args()
 
     # Prepare words list
     wanted_words = FLAGS.wanted_words.split(",")
+    num_labels = len(input_data.prepare_words_list(wanted_words))
 
     # Prepare model settings
     model_settings = prepare_model_settings(
-        len(input_data.prepare_words_list(wanted_words)),
+        num_labels,
         FLAGS.sample_rate,
         FLAGS.clip_duration_ms,
         FLAGS.window_size_ms,
@@ -104,38 +124,27 @@ def main():
         None,
     )
 
-    # Time shift in samples
     time_shift_samples = int((FLAGS.time_shift_ms * FLAGS.sample_rate) / 1000)
 
     # Create datasets
-    train_ds = audio_processor.dataset(
-        "training", FLAGS.batch_size,
-        FLAGS.background_frequency,
-        FLAGS.background_volume,
-        time_shift_samples
-    )
-
+    train_ds = audio_processor.dataset("training", FLAGS.batch_size,
+                                       FLAGS.background_frequency,
+                                       FLAGS.background_volume,
+                                       time_shift_samples)
     val_ds = audio_processor.dataset("validation", FLAGS.batch_size, 0, 0, 0)
     test_ds = audio_processor.dataset("testing", FLAGS.batch_size, 0, 0, 0)
 
     # Build model
-    fingerprint_size = model_settings["fingerprint_size"]
-    label_count = model_settings["label_count"]
-    dummy_input = tf.keras.Input(shape=(fingerprint_size,), batch_size=None)
-    model = models.create_model(
-        dummy_input,
-        model_settings,
-        FLAGS.model_architecture,
-        is_training=True
-    )
+    model = build_tf2_model(model_settings, FLAGS.model_architecture)
 
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    # Optimizer, loss, metrics
     training_steps_list = list(map(int, FLAGS.how_many_training_steps.split(",")))
     learning_rates_list = list(map(float, FLAGS.learning_rate.split(",")))
     optimizer = tf.keras.optimizers.Adam(learning_rates_list[0])
-
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     train_acc = tf.keras.metrics.SparseCategoricalAccuracy()
     val_acc = tf.keras.metrics.SparseCategoricalAccuracy()
+
     step, stage, stage_steps = 0, 0, training_steps_list[0]
 
     print("Starting training...")
