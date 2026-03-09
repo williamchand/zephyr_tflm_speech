@@ -7,37 +7,33 @@ import logging
 import os
 
 import tensorflow as tf
-import input_data
 import models
+import input_data
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-try:
-    from tensorflow.lite.experimental.microfrontend.python.ops import audio_microfrontend_op as frontend_op
-except ImportError:
-    frontend_op = None
 
 class SpeechCommandsInferenceModel(tf.Module):
-    """Wraps the Keras model for TF SavedModel export."""
+    """Wraps the Keras model for TF SavedModel or TFLite export."""
 
     def __init__(self, keras_model, model_settings, preprocess):
         super().__init__(name='speech_commands_inference')
         self._model = keras_model
 
-        # Flatten model_settings into primitives
+        # Flatten model_settings
         self.desired_samples = int(model_settings['desired_samples'])
         self.window_size = int(model_settings['window_size_samples'])
         self.window_stride = int(model_settings['window_stride_samples'])
         self.fingerprint_width = int(model_settings['fingerprint_width'])
         self.fingerprint_size = int(model_settings['fingerprint_size'])
-        self.average_window_width = int(model_settings.get('average_window_width', -1))
+        self.average_window_width = model_settings.get('average_window_width', -1)
         self.sample_rate = int(model_settings['sample_rate'])
         self.preprocess_mode = str(preprocess)
 
     @tf.function(input_signature=[tf.TensorSpec(shape=[], dtype=tf.string)])
     def infer(self, wav_data):
-        # Decode WAV bytes
+        # Decode WAV
         decoded = tf.audio.decode_wav(
             wav_data,
             desired_channels=1,
@@ -54,7 +50,7 @@ class SpeechCommandsInferenceModel(tf.Module):
         )
         spectrogram = tf.abs(spectrogram)
 
-        # Feature preprocessing
+        # Preprocess features
         if self.preprocess_mode == 'average':
             fingerprint_input = tf.nn.pool(
                 tf.expand_dims(spectrogram, -1),
@@ -63,49 +59,48 @@ class SpeechCommandsInferenceModel(tf.Module):
                 pooling_type='AVG',
                 padding='SAME'
             )
-        elif self.preprocess_mode == 'mfcc':
+        elif self.preprocess_mode in ('mfcc', 'micro'):
             fingerprint_input = tf.signal.mfccs_from_log_mel_spectrograms(
                 tf.math.log(tf.maximum(spectrogram, 1e-6))
             )
         else:
-            raise ValueError("Unknown preprocess mode {}".format(self.preprocess_mode))
+            raise ValueError(f"Unknown preprocess mode {self.preprocess_mode}")
 
         reshaped = tf.reshape(fingerprint_input, [-1, self.fingerprint_size])
         logits = self._model(reshaped, training=False)
         return tf.nn.softmax(logits, name='labels_softmax')
 
+
 # -----------------------------
-# Build inference model
+# Model creation and export
 # -----------------------------
 def create_inference_model(FLAGS):
-    # Prepare model settings
     words_list = input_data.prepare_words_list(FLAGS.wanted_words.split(','))
     model_settings = models.prepare_model_settings(
-        len(words_list),
-        FLAGS.sample_rate,
-        FLAGS.clip_duration_ms,
-        FLAGS.window_size_ms,
-        FLAGS.window_stride_ms,
-        FLAGS.feature_bin_count,
-        FLAGS.preprocess
+        label_count=len(words_list),
+        sample_rate=FLAGS.sample_rate,
+        clip_duration_ms=FLAGS.clip_duration_ms,
+        window_size_ms=FLAGS.window_size_ms,
+        window_stride_ms=FLAGS.window_stride_ms,
+        feature_bin_count=FLAGS.feature_bin_count,
+        preprocess=FLAGS.preprocess
     )
 
     # Build Keras model
     dummy_input = tf.keras.Input(shape=(model_settings['fingerprint_size'],), name='fingerprint_input')
     result = models.create_model(
-        dummy_input, model_settings, FLAGS.model_architecture, is_training=False
+        dummy_input,
+        model_settings,
+        FLAGS.model_architecture,
+        is_training=False
     )
     logits = result[0] if isinstance(result, tuple) else result
     keras_model = tf.keras.Model(inputs=dummy_input, outputs=logits)
 
-    # Wrap into inference module
     inference_module = SpeechCommandsInferenceModel(keras_model, model_settings, FLAGS.preprocess)
     return inference_module, model_settings
 
 
-# -----------------------------
-# Save helpers
-# -----------------------------
 def save_saved_model(output_dir, inference_module):
     os.makedirs(output_dir, exist_ok=True)
     tf.saved_model.save(
@@ -131,14 +126,10 @@ def save_tflite(output_file, inference_module, quantize=False):
     logger.info("Saved TFLite model to %s", output_file)
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
-    # Build model + inference wrapper
     inference_module, _ = create_inference_model(FLAGS)
 
-    # Restore weights if checkpoint is provided
+    # Restore checkpoint if provided
     if FLAGS.start_checkpoint:
         checkpoint = tf.train.Checkpoint(model=inference_module._model)
         checkpoint.restore(FLAGS.start_checkpoint).expect_partial()
@@ -149,10 +140,9 @@ def main():
     if save_format == 'saved_model':
         save_saved_model(FLAGS.output_file, inference_module)
     elif save_format in ('graph_def', 'tflite'):
-        if not FLAGS.output_file.endswith('.tflite'):
-            output_file = FLAGS.output_file + '.tflite'
-        else:
-            output_file = FLAGS.output_file
+        output_file = FLAGS.output_file
+        if not output_file.endswith('.tflite'):
+            output_file += '.tflite'
         save_tflite(output_file, inference_module, quantize=FLAGS.quantize)
     else:
         raise ValueError(f"Unknown save_format {save_format}")
@@ -165,16 +155,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--sample_rate', type=int, default=16000)
     parser.add_argument('--clip_duration_ms', type=int, default=1000)
-    parser.add_argument('--clip_stride_ms', type=int, default=30)
     parser.add_argument('--window_size_ms', type=float, default=30.0)
     parser.add_argument('--window_stride_ms', type=float, default=10.0)
     parser.add_argument('--feature_bin_count', type=int, default=40)
     parser.add_argument('--start_checkpoint', type=str, default='')
     parser.add_argument('--model_architecture', type=str, default='conv')
-    parser.add_argument('--wanted_words', type=str, default='yes,no,up,down,left,right,on,off,stop,go')
+    parser.add_argument('--wanted_words', type=str,
+                        default='yes,no,up,down,left,right,on,off,stop,go')
     parser.add_argument('--output_file', type=str, required=True)
     parser.add_argument('--quantize', action='store_true', default=False)
-    parser.add_argument('--preprocess', type=str, default='mfcc')
+    parser.add_argument('--preprocess', type=str, default='mfcc',
+                        choices=['mfcc', 'micro', 'average'])
     parser.add_argument('--save_format', type=str, default='saved_model')
     FLAGS = parser.parse_args()
 
