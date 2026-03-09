@@ -100,9 +100,8 @@ class FastAudioProcessor(input_data.AudioProcessor):
                 wav = tf.clip_by_value(wav + volume * bg, -1.0, 1.0)
 
         return wav, label
-
     def _extract_features(self, wav):
-
+        """Compute features (MFCC / average / micro) from raw waveform."""
         spectrogram = audio_ops.audio_spectrogram(
             wav,
             window_size=self.model_settings["window_size_samples"],
@@ -110,16 +109,16 @@ class FastAudioProcessor(input_data.AudioProcessor):
             magnitude_squared=True,
         )
 
-        if self.model_settings["preprocess"] == "mfcc":
+        preprocess_mode = self.model_settings["preprocess"]
 
+        if preprocess_mode == "mfcc":
             features = audio_ops.mfcc(
                 spectrogram,
                 self.model_settings["sample_rate"],
                 dct_coefficient_count=self.model_settings["fingerprint_width"],
             )
 
-        elif self.model_settings["preprocess"] == "average":
-
+        elif preprocess_mode == "average":
             features = tf.nn.pool(
                 tf.expand_dims(spectrogram, -1),
                 window_shape=[1, self.model_settings["average_window_width"]],
@@ -128,12 +127,38 @@ class FastAudioProcessor(input_data.AudioProcessor):
                 padding="SAME",
             )
 
-        else:
+        elif preprocess_mode == "micro":
+            # TF2 version of microfrontend
+            try:
+                from tensorflow.lite.experimental.microfrontend.python.ops import audio_microfrontend_op as frontend_op
+            except ImportError:
+                raise ValueError(
+                    "Micro frontend op not available. "
+                    "Install tensorflow-lite-micro or build from Bazel."
+                )
 
-            raise ValueError("Unsupported preprocess mode")
+            sample_rate = self.model_settings["sample_rate"]
+            window_size_ms = self.model_settings["window_size_samples"] * 1000 / sample_rate
+            window_step_ms = self.model_settings["window_stride_samples"] * 1000 / sample_rate
+            int16_input = tf.cast(tf.multiply(wav, 32768), tf.int16)
+
+            micro_features = frontend_op.audio_microfrontend(
+                int16_input,
+                sample_rate=sample_rate,
+                window_size=window_size_ms,
+                window_step=window_step_ms,
+                num_channels=self.model_settings["fingerprint_width"],
+                out_scale=1,
+                out_type=tf.float32,
+            )
+
+            # Scale to match TF1 micro_speech output
+            features = tf.multiply(micro_features, 10.0 / 256.0)
+
+        else:
+            raise ValueError(f"Unsupported preprocess mode: {preprocess_mode}")
 
         return tf.reshape(features, [-1])
-
     # --------------------------------------------------------
     # TF DATA PIPELINE
     # --------------------------------------------------------
