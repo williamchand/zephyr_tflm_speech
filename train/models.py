@@ -104,9 +104,26 @@ def prepare_model_settings(label_count, sample_rate, clip_duration_ms,
 # ---------------------------------------------------------------------------
 
 def load_variables_from_checkpoint(sess, start_checkpoint):
-    """Compatibility shim — in TF2 use tf.train.Checkpoint.restore() instead."""
-    saver = tf.compat.v1.train.Saver(tf.compat.v1.global_variables())
-    saver.restore(sess, start_checkpoint)
+    """Compatibility shim for callers that still pass a checkpoint path.
+
+    The `sess` argument is ignored (TF2 has no sessions).  Weights are
+    restored via tf.train.Checkpoint so this works correctly with Keras models.
+
+    For new code, prefer calling tf.train.Checkpoint(model=model).restore(...)
+    directly.
+
+    Args:
+      sess:             Ignored.  Accepted for API compatibility only.
+      start_checkpoint: Path prefix to a TF2 checkpoint written by
+                        tf.train.CheckpointManager (e.g.
+                        '/tmp/train/conv.ckpt-1000').
+    """
+    # tf.train.Checkpoint with no model specified will match variables by
+    # name when .restore() is called, which is the closest TF2 equivalent
+    # to the TF1 Saver behaviour.
+    ckpt = tf.train.Checkpoint()
+    status = ckpt.restore(start_checkpoint)
+    status.expect_partial()   # optimizer slots won't be present — that's OK
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +390,7 @@ class _LowLatencySVDFModel(tf.keras.Model):
         self._rank = rank
         self._num_units = num_units
         self._num_filters = num_filters
+        self._num_new_frames_at_inference = None   # set by _build_low_latency_svdf
         self.drop1 = tf.keras.layers.Dropout(dropout_rate)
 
         self.fc1 = tf.keras.layers.Dense(
@@ -394,10 +412,13 @@ class _LowLatencySVDFModel(tf.keras.Model):
 
     def call(self, fingerprint_input, training=False):  # pylint: disable=arguments-differ
         # fingerprint_input: [batch, time*freq] with oldest frame at [:, 0]
-        if training:
+        # num_new_frames: during training we process the full clip each step.
+        # During inference with runtime_settings, we only process the new
+        # frames since the last call (clip_stride_ms worth of frames).
+        if training or self._num_new_frames_at_inference is None:
             num_new_frames = self._time
         else:
-            num_new_frames = self._time  # simplified; update for streaming use
+            num_new_frames = self._num_new_frames_at_inference
 
         new_input = fingerprint_input[:, -num_new_frames * self._freq:]
         new_input = tf.expand_dims(new_input, 2)  # [batch, frames*freq, 1]
@@ -441,6 +462,18 @@ def _build_low_latency_svdf(fingerprint_input, model_settings, is_training,
         model_settings['spectrogram_length'],
         model_settings['fingerprint_width'],
         model_settings['label_count'])
+
+    # Wire runtime_settings so the model knows how many new frames to process
+    # per inference call (used for streaming / on-device deployment).
+    if runtime_settings and 'clip_stride_ms' in runtime_settings:
+        stride_ms     = runtime_settings['clip_stride_ms']
+        sample_rate   = model_settings['sample_rate']
+        window_stride = model_settings['window_stride_samples']
+        stride_samples = int(sample_rate * stride_ms / 1000)
+        # Number of new spectrogram frames produced by one stride.
+        num_new_frames = stride_samples // window_stride
+        model._num_new_frames_at_inference = num_new_frames
+
     logits = model(fingerprint_input, training=is_training)
     if is_training:
         return logits, _make_dropout_placeholder()
