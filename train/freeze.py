@@ -212,7 +212,7 @@ def save_saved_model(output_path, inference_module):
     logger.info('Saved SavedModel to %s', output_path)
 
 
-def save_tflite(output_file, inference_module):
+def save_tflite(output_file, inference_module, quantize=False):
     """Converts the inference module to a TFLite FlatBuffer and writes it.
 
     This is the TF2 replacement for the frozen GraphDef (.pb) format used in
@@ -222,10 +222,17 @@ def save_tflite(output_file, inference_module):
     Args:
       output_file:       Path for the output .tflite file.
       inference_module:  SpeechCommandsInferenceModel instance.
+      quantize:          If True, apply post-training dynamic-range quantization
+                         (weights quantized to int8, activations quantized at
+                         inference time).  Reduces model size ~4× with minimal
+                         accuracy loss on most architectures.
     """
     converter = tf.lite.TFLiteConverter.from_concrete_functions(
         [inference_module.infer.get_concrete_function()],
         inference_module)
+    if quantize:
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        logger.info('Post-training quantization enabled (dynamic-range int8).')
     tflite_model = converter.convert()
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
     with open(output_file, 'wb') as f:
@@ -268,7 +275,7 @@ def main():
         output_file = FLAGS.output_file
         if not output_file.endswith('.tflite'):
             output_file += '.tflite'
-        save_tflite(output_file, inference_module)
+        save_tflite(output_file, inference_module, quantize=FLAGS.quantize)
     else:
         raise ValueError(
             'Unknown save_format "%s" (should be "saved_model", "graph_def", '
