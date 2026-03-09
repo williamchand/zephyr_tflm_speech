@@ -70,6 +70,11 @@ def main():
     parser.add_argument("--time_shift_ms", type=float, default=100.0)
     parser.add_argument("--preprocess", type=str, default="mfcc")
     parser.add_argument("--summaries_dir", type=str, default="logs/")
+    # --- Redundant TF1-style flags to accept original calls ---
+    parser.add_argument("--train_dir", type=str, default="train/")
+    parser.add_argument("--verbosity", type=str, default="WARN")
+    parser.add_argument("--eval_step_interval", type=int, default=1000)
+    parser.add_argument("--save_step_interval", type=int, default=1000)
     FLAGS = parser.parse_args()
 
     # Prepare words list
