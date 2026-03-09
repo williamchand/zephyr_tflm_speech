@@ -66,7 +66,7 @@ def main():
     FLAGS = parser.parse_args()
 
     wanted_words = FLAGS.wanted_words.split(",")
-
+    
     model_settings = models.prepare_model_settings(
         len(input_data.prepare_words_list(wanted_words)),
         FLAGS.sample_rate,
@@ -74,6 +74,7 @@ def main():
         FLAGS.window_size_ms,
         FLAGS.window_stride_ms,
         FLAGS.dct_coefficient_count,
+        FLAGS.preprocess,  # <-- pass preprocess mode here
     )
 
     audio_processor = FastAudioProcessor(
