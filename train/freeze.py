@@ -18,81 +18,61 @@ try:
 except ImportError:
     frontend_op = None
 
-
-# -----------------------------
-# Inference module
-# -----------------------------
 class SpeechCommandsInferenceModel(tf.Module):
-    """Wraps the Keras model and provides WAV bytes -> softmax inference."""
+    """Wraps the Keras model for TF SavedModel export."""
 
     def __init__(self, keras_model, model_settings, preprocess):
         super().__init__(name='speech_commands_inference')
         self._model = keras_model
 
-        # Extract only primitive values (no dicts!)
+        # Flatten model_settings into primitives
         self.desired_samples = int(model_settings['desired_samples'])
         self.window_size = int(model_settings['window_size_samples'])
         self.window_stride = int(model_settings['window_stride_samples'])
         self.fingerprint_width = int(model_settings['fingerprint_width'])
         self.fingerprint_size = int(model_settings['fingerprint_size'])
         self.average_window_width = int(model_settings.get('average_window_width', -1))
-        self.preprocess_mode = str(preprocess)
         self.sample_rate = int(model_settings['sample_rate'])
+        self.preprocess_mode = str(preprocess)
 
-        @tf.function(input_signature=[tf.TensorSpec(shape=[], dtype=tf.string)])
-        def infer(wav_data):
-            # Decode WAV bytes
-            decoded = tf.audio.decode_wav(
-                wav_data,
-                desired_channels=1,
-                desired_samples=self.desired_samples
+    @tf.function(input_signature=[tf.TensorSpec(shape=[], dtype=tf.string)])
+    def infer(self, wav_data):
+        # Decode WAV bytes
+        decoded = tf.audio.decode_wav(
+            wav_data,
+            desired_channels=1,
+            desired_samples=self.desired_samples
+        )
+        audio_tensor = tf.squeeze(decoded.audio, axis=-1)
+
+        # STFT
+        spectrogram = tf.signal.stft(
+            audio_tensor,
+            frame_length=self.window_size,
+            frame_step=self.window_stride,
+            fft_length=self.window_size
+        )
+        spectrogram = tf.abs(spectrogram)
+
+        # Feature preprocessing
+        if self.preprocess_mode == 'average':
+            fingerprint_input = tf.nn.pool(
+                tf.expand_dims(spectrogram, -1),
+                window_shape=[1, self.average_window_width],
+                strides=[1, self.average_window_width],
+                pooling_type='AVG',
+                padding='SAME'
             )
-            audio_tensor = tf.squeeze(decoded.audio, axis=-1)
-
-            # Spectrogram
-            spectrogram = tf.signal.stft(
-                audio_tensor,
-                frame_length=self.window_size,
-                frame_step=self.window_stride,
-                fft_length=self.window_size
+        elif self.preprocess_mode == 'mfcc':
+            fingerprint_input = tf.signal.mfccs_from_log_mel_spectrograms(
+                tf.math.log(tf.maximum(spectrogram, 1e-6))
             )
-            spectrogram = tf.abs(spectrogram)
+        else:
+            raise ValueError("Unknown preprocess mode {}".format(self.preprocess_mode))
 
-            # Feature preprocessing
-            if self.preprocess_mode == 'average':
-                fingerprint_input = tf.nn.pool(
-                    input=tf.expand_dims(spectrogram, -1),
-                    window_shape=[1, self.average_window_width],
-                    strides=[1, self.average_window_width],
-                    pooling_type='AVG',
-                    padding='SAME'
-                )
-            elif self.preprocess_mode == 'mfcc':
-                fingerprint_input = tf.signal.mfccs_from_log_mel_spectrograms(
-                    tf.math.log(tf.maximum(spectrogram, 1e-6))
-                )
-            elif self.preprocess_mode == 'micro':
-                if not frontend_op:
-                    raise Exception("Microfrontend op not available.")
-                int16_input = tf.cast(audio_tensor * 32767, tf.int16)
-                fingerprint_input = frontend_op.audio_microfrontend(
-                    int16_input,
-                    sample_rate=self.sample_rate,
-                    window_size=(self.window_size * 1000) / self.sample_rate,
-                    window_step=(self.window_stride * 1000) / self.sample_rate,
-                    num_channels=self.fingerprint_width,
-                    out_scale=1,
-                    out_type=tf.float32
-                )
-            else:
-                raise ValueError(f"Unknown preprocess mode {self.preprocess_mode}")
-
-            reshaped = tf.reshape(fingerprint_input, [-1, self.fingerprint_size])
-            logits = self._model(reshaped, training=False)
-            return tf.nn.softmax(logits, name='labels_softmax')
-
-        self.infer = infer
-
+        reshaped = tf.reshape(fingerprint_input, [-1, self.fingerprint_size])
+        logits = self._model(reshaped, training=False)
+        return tf.nn.softmax(logits, name='labels_softmax')
 
 # -----------------------------
 # Build inference model
