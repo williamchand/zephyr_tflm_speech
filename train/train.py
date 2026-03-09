@@ -260,8 +260,27 @@ def build_dataset(audio_processor, model_settings, mode,
                 features = audio_ops.mfcc(
                     spectrogram, sr,
                     dct_coefficient_count=fp_width)
+            elif preprocess == 'micro':
+                try:
+                    from tensorflow.lite.experimental.microfrontend.python.ops \
+                        import audio_microfrontend_op as frontend_op
+                except ImportError:
+                    raise ImportError(
+                        'Micro frontend op unavailable. Build with Bazel or '
+                        'install the microfrontend package.')
+                ws_ms   = (window_size   * 1000) / sample_rate
+                wt_ms   = (window_stride * 1000) / sample_rate
+                i16     = tf.cast(tf.multiply(mixed, 32768), tf.int16)
+                mf      = frontend_op.audio_microfrontend(
+                    i16, sample_rate=sample_rate,
+                    window_size=ws_ms, window_step=wt_ms,
+                    num_channels=fp_width, out_scale=1,
+                    out_type=tf.float32)
+                features = tf.multiply(mf, 10.0 / 256.0)
             else:
-                raise ValueError('Unsupported preprocess: ' + preprocess)
+                raise ValueError(
+                    'Unknown preprocess mode "%s" (should be "mfcc", '
+                    '"average", or "micro")' % preprocess)
 
             # tf.reshape with a Python-int constant is safe here because
             # there is no input_signature — TF traces with the real runtime
