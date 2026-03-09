@@ -121,7 +121,13 @@ def main():
     # Build model
     fingerprint_size = model_settings["fingerprint_size"]
     label_count = model_settings["label_count"]
-    model = models.create_model(fingerprint_size, label_count, FLAGS.model_architecture, is_training=True)
+    dummy_input = tf.keras.Input(shape=(fingerprint_size,), batch_size=None)
+    model = models.create_model(
+        dummy_input,
+        model_settings,
+        FLAGS.model_architecture,
+        is_training=True
+    )
 
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     training_steps_list = list(map(int, FLAGS.how_many_training_steps.split(",")))
