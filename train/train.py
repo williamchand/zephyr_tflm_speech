@@ -758,6 +758,20 @@ def build_model(architecture, model_settings):
     jit_compile=True enables XLA fusion of the training step for ~10–30%
     throughput improvement on GPU.
 
+    Optimizer note
+    ──────────────
+    When mixed_float16 is active, Keras automatically wraps Adam in a
+    LossScaleOptimizer.  The default dynamic loss scaler uses tf.cond
+    to check for non-finite gradients, which creates a cross-replica
+    synchronisation point inside the XLA-compiled training step.
+    MirroredStrategy + jit_compile=True cannot cross that boundary and
+    raises "merge_call called while defining a new graph".
+
+    Fix: wrap Adam in a *fixed* LossScaleOptimizer (dynamic=False).
+    A fixed scale never calls tf.cond, making it fully compatible with
+    jit_compile=True and MirroredStrategy.  initial_scale=2**15 (32768)
+    is the standard value for float16 mixed-precision training.
+
     Args:
         architecture:   Key from MODEL_BUILDERS.
         model_settings: Dict from model_settings_lib.prepare_model_settings().
@@ -766,8 +780,18 @@ def build_model(architecture, model_settings):
         Compiled tf.keras.Model.
     """
     model = MODEL_BUILDERS[architecture](model_settings)
+
+    base_opt = tf.keras.optimizers.Adam()
+    if tf.keras.mixed_precision.global_policy().name == 'mixed_float16':
+        # Fixed scale avoids the dynamic tf.cond incompatible with
+        # jit_compile=True + MirroredStrategy.
+        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(
+            base_opt, dynamic=False, initial_scale=2 ** 15)
+    else:
+        optimizer = base_opt
+
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(),
+        optimizer=optimizer,
         loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=['accuracy'],
         jit_compile=True,
