@@ -247,11 +247,24 @@ def shift_ring_buffer(ring_buffer, new_feature):
 # Per-frame feature extraction   (reference: generate_features / audio_pp)
 # ============================================================================
 
-def _frame_features_micro_tf1(frame_samples, ms):
-    """Isolated TF1 block: microfrontend op on one audio window.
+def _frame_features_micro_eager(frame_samples, ms):
+    """Applies audio_microfrontend eagerly to one audio window.
 
-    Only called when preprocess='micro'.  Use mfcc or average for new
-    training — those are fully TF2 eager.
+    No TF1 session or placeholder.  The op is called directly as an
+    EagerTensor operation, matching the reference file's op signature
+    (tensorflow.lite.experimental.microfrontend.ops.audio_microfrontend_op)
+    exactly.
+
+    Parameters match the reference audio_microfrontend() signature.
+    out_type=tf.float32 + 10.0/256.0 scaling is kept for consistency
+    with the training pipeline.
+
+    Args:
+        frame_samples: float32 ndarray [window_size_samples], range [-1, 1].
+        ms:            model_settings dict.
+
+    Returns:
+        float32 ndarray [fingerprint_width] — one ring-buffer row.
     """
     try:
         from tensorflow.lite.experimental.microfrontend.python.ops \
@@ -259,28 +272,42 @@ def _frame_features_micro_tf1(frame_samples, ms):
     except ImportError:
         raise RuntimeError(
             'preprocess=micro requires the audio_microfrontend C++ op '
-            '(Bazel build only). Use --preprocess=mfcc or average.')
+            '(tensorflow.lite.experimental.microfrontend). '
+            'Use --preprocess=mfcc or --preprocess=average instead.')
 
     sample_rate    = ms['sample_rate']
     window_size_ms = ms['window_size_samples'] * 1000 / sample_rate
     window_step_ms = ms['window_stride_samples'] * 1000 / sample_rate
 
-    tf.compat.v1.disable_eager_execution()
-    g = tf.compat.v1.Graph()
-    with g.as_default():
-        wav_ph = tf.compat.v1.placeholder(tf.float32, [None, 1])
-        int16  = tf.cast(tf.multiply(wav_ph, 32768), tf.int16)
-        mfe    = frontend_op.audio_microfrontend(
-            int16,
-            sample_rate=sample_rate,
-            window_size=window_size_ms,
-            window_step=window_step_ms,
-            num_channels=ms['fingerprint_width'],
-            out_scale=1, out_type=tf.float32)
-        out    = tf.multiply(mfe, 10.0 / 256.0)
-    with tf.compat.v1.Session(graph=g) as sess:
-        result = sess.run(out, feed_dict={wav_ph: frame_samples.reshape(-1, 1)})
-    return result.squeeze(axis=0).astype(np.float32)   # [fingerprint_width]
+    int16 = tf.cast(tf.multiply(tf.constant(frame_samples), 32768), tf.int16)
+
+    mfe = frontend_op.audio_microfrontend(
+        int16,
+        sample_rate=sample_rate,
+        window_size=window_size_ms,
+        window_step=window_step_ms,
+        num_channels=ms['fingerprint_width'],
+        upper_band_limit=7500.0,
+        lower_band_limit=125.0,
+        smoothing_bits=10,
+        even_smoothing=0.025,
+        odd_smoothing=0.06,
+        min_signal_remaining=0.05,
+        enable_pcan=True,
+        pcan_strength=0.95,
+        pcan_offset=80.0,
+        gain_bits=21,
+        enable_log=True,
+        scale_shift=6,
+        left_context=0,
+        right_context=0,
+        frame_stride=1,
+        zero_padding=False,
+        out_scale=1,
+        out_type=tf.float32)
+
+    # squeeze [1, fingerprint_width] → [fingerprint_width]
+    return tf.multiply(mfe, 10.0 / 256.0).numpy().squeeze(axis=0).astype(np.float32)
 
 
 def generate_features_tf2(frame_samples, ms):
@@ -305,7 +332,7 @@ def generate_features_tf2(frame_samples, ms):
     preprocess = ms['preprocess']
 
     if preprocess == 'micro':
-        return _frame_features_micro_tf1(frame_samples, ms)
+        return _frame_features_micro_eager(frame_samples, ms)
 
     # Run STFT on one window.  frame_step = frame_length so we get exactly
     # one output frame ([1, F_bins]).
