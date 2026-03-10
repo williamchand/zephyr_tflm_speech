@@ -81,7 +81,7 @@ import seaborn as sns
 import tensorflow as tf
 
 import input_data
-import model_settings as model_settings_lib
+import models as model_settings_lib
 
 
 # ============================================================================
